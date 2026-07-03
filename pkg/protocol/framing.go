@@ -142,7 +142,15 @@ func frameTyped(buf []byte) (core.PGMessage, int, bool, error) {
 		return core.PGMessage{}, 0, false, fmt.Errorf("protocol: invalid length %d for message type %q", length, typ)
 	}
 
-	total := 1 + int(length) // type byte is not included in length
+	// Guard against malicious or corrupt large-length values: cap at 256MB to
+	// prevent a single frame from allocating ~4GB and causing OOM (R3.6). Real
+	// PG messages rarely exceed a few MB (even COPY payloads are chunked).
+	const maxFrameLength = 256 * 1024 * 1024 // 256 MB
+	if length > maxFrameLength {
+		return core.PGMessage{}, 0, false, fmt.Errorf("protocol: frame length %d exceeds max %d for message type %q", length, maxFrameLength, typ)
+	}
+
+	total := 1 + int(length) // type byte is not included in length; safe on 64-bit (length <= 256MB)
 	if len(buf) < total {
 		return core.PGMessage{}, 0, false, nil
 	}

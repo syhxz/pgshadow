@@ -129,8 +129,14 @@ func (b *EventBuilder) Build(conn core.ConnID, msg core.PGMessage, ts time.Time)
 
 // oversized reports whether the extracted SQL text exceeds the effective
 // maximum SQL length, marking the originating message as oversized (R3.5).
+// A zero or negative effective limit is treated as "no limit" (defense-in-depth
+// against misconfiguration silently discarding all SQL).
 func (b *EventBuilder) oversized(sql string) bool {
-	return len(sql) > effectiveMaxSQLLength(b.cfg)
+	max := effectiveMaxSQLLength(b.cfg)
+	if max <= 0 {
+		return false
+	}
+	return len(sql) > max
 }
 
 // recordParseError invokes the parse-error metrics hook when one is wired. It is

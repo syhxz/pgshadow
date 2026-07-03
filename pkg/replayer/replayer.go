@@ -122,6 +122,7 @@ type Config struct {
 	TargetDialect   string          `yaml:"target_dialect"`          // postgresql|greenplum; default postgresql R8.2
 	PoolMaxConns    int             `yaml:"pool_max_conns"`          // default 100 R9.2
 	PoolMinConns    int             `yaml:"pool_min_conns"`          // default 20 R9.3
+	MaxLaneDepth    int             `yaml:"max_lane_depth"`          // max total events buffered in lanes; 0 = default (100000)
 }
 
 // PoolStats reports connection pool usage.

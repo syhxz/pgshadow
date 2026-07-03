@@ -168,10 +168,8 @@ func NewFailoverDetector(host string, port int, interval time.Duration, onFailov
 // Start begins periodic monitoring. Call Stop() to halt.
 func (fd *FailoverDetector) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
-	fd.cancel = cancel
-
-	// Resolve initial IP
 	fd.mu.Lock()
+	fd.cancel = cancel
 	fd.currentIP = resolveHost(fd.sourceHost)
 	fd.mu.Unlock()
 
@@ -180,8 +178,11 @@ func (fd *FailoverDetector) Start() {
 
 // Stop halts the monitoring loop.
 func (fd *FailoverDetector) Stop() {
-	if fd.cancel != nil {
-		fd.cancel()
+	fd.mu.Lock()
+	cancel := fd.cancel
+	fd.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -294,7 +295,6 @@ func (rc *ResultComparator) Record(r ReplayResult) {
 	if len(rc.diffs) < rc.maxDiffs {
 		rc.diffs = append(rc.diffs, diff)
 	}
-	rc.mu.Unlock()
 
 	if rc.outputFile != nil {
 		line := fmt.Sprintf("%s [%s] %s: %s (source=%.1fms target=%.1fms err=%q)\n",
@@ -307,6 +307,7 @@ func (rc *ResultComparator) Record(r ReplayResult) {
 		)
 		rc.outputFile.WriteString(line)
 	}
+	rc.mu.Unlock()
 }
 
 func (rc *ResultComparator) analyze(r ReplayResult) Diff {

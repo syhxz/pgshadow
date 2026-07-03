@@ -8,6 +8,7 @@ import (
 
 	"pgshadow/pkg/core"
 	"pgshadow/pkg/filter"
+	"pgshadow/pkg/pipeline"
 	"pgshadow/pkg/protocol"
 )
 
@@ -68,12 +69,12 @@ func testConn() core.ConnID {
 	}
 }
 
-func newTestProcessor(t *testing.T, fcfg filter.Config) (*streamProcessor, *recordingQueue) {
+func newTestProcessor(t *testing.T, fcfg filter.Config) (*pipeline.StreamProcessor, *recordingQueue) {
 	t.Helper()
 	q := &recordingQueue{}
-	sp, err := newStreamProcessor(protocol.Config{ExtendedQuery: true}, fcfg, q, nil)
+	sp, err := pipeline.NewStreamProcessor(protocol.Config{ExtendedQuery: true}, fcfg, q, nil)
 	if err != nil {
-		t.Fatalf("newStreamProcessor: %v", err)
+		t.Fatalf("NewStreamProcessor: %v", err)
 	}
 	return sp, q
 }
@@ -116,17 +117,17 @@ func TestReadyForQueryUpdatesState(t *testing.T) {
 	conn := testConn()
 
 	sp.OnBytes(conn, false, readyForQuery('T'))
-	if got := sp.sm.State(conn); got != core.TxInTx {
+	if got := sp.StateMachine().State(conn); got != core.TxInTx {
 		t.Fatalf("after Z='T' state = %v, want TxInTx", got)
 	}
 
 	sp.OnBytes(conn, false, readyForQuery('I'))
-	if got := sp.sm.State(conn); got != core.TxIdle {
+	if got := sp.StateMachine().State(conn); got != core.TxIdle {
 		t.Fatalf("after Z='I' state = %v, want TxIdle", got)
 	}
 
 	sp.OnBytes(conn, false, readyForQuery('E'))
-	if got := sp.sm.State(conn); got != core.TxFailed {
+	if got := sp.StateMachine().State(conn); got != core.TxFailed {
 		t.Fatalf("after Z='E' state = %v, want TxFailed", got)
 	}
 }
@@ -157,7 +158,7 @@ func TestTransactionStateGatesPlainSelect(t *testing.T) {
 		if len(q.events) != 2 {
 			t.Fatalf("enqueued %d events, want 2 (BEGIN + in-tx SELECT)", len(q.events))
 		}
-		if got := sp.sm.State(conn); got != core.TxInTx {
+		if got := sp.StateMachine().State(conn); got != core.TxInTx {
 			t.Errorf("state after BEGIN = %v, want TxInTx", got)
 		}
 		if q.events[1].SQL != "SELECT * FROM t" {
@@ -177,18 +178,18 @@ func TestOnCloseReleasesState(t *testing.T) {
 	conn := testConn()
 
 	sp.OnBytes(conn, true, append(startupMsg(), simpleQuery("INSERT INTO t VALUES (1)")...))
-	if len(sp.parsers) == 0 || sp.seq[conn] == 0 {
+	if !sp.HasParser(conn) || sp.SeqFor(conn) == 0 {
 		t.Fatal("expected per-connection state after processing")
 	}
 
 	sp.OnClose(conn)
-	if _, ok := sp.parsers[conn]; ok {
+	if sp.HasParser(conn) {
 		t.Error("parser state not released on close")
 	}
-	if _, ok := sp.seq[conn]; ok {
+	if sp.HasSeq(conn) {
 		t.Error("sequence state not released on close")
 	}
-	if got := sp.sm.State(conn); got != core.TxIdle {
+	if got := sp.StateMachine().State(conn); got != core.TxIdle {
 		t.Errorf("state after close = %v, want TxIdle (forgotten)", got)
 	}
 }

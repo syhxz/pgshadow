@@ -61,6 +61,15 @@ const defaultPoolMaxConns = 100
 // Buffer_Queue (R7.7).
 const laneBufferSize = 64
 
+// defaultMaxLaneDepth is the maximum total number of events buffered across all
+// lane queues before the dispatcher pauses dequeuing from the upstream queue.
+// This prevents OOM when the target is slow/down, even when no replayguard is
+// configured. Events are NOT dropped — they remain in the upstream queue (which
+// handles overflow via its own policy: ring buffer drops oldest, file queue
+// persists to disk, Kafka retains on broker). Production traffic is never
+// affected because the capture→queue path is independent of replay consumption.
+const defaultMaxLaneDepth = 100000
+
 // serialLaneKey is the routing key used for every event in serial mode so that
 // all ConnIDs share one global lane and replay in captured order (R7.12).
 const serialLaneKey = "__serial__"
@@ -96,8 +105,9 @@ type replayer struct {
 	execHook    func(err error)        // optional post-execution hook for metrics
 	guard       *replayguard.Guard     // optional safeguard for backpressure checks (#10)
 
-	serial      bool // single global lane (R7.12)
-	concurrency int  // max events executing concurrently across lanes
+	serial       bool // single global lane (R7.12)
+	concurrency  int  // max events executing concurrently across lanes
+	maxLaneDepth int  // max total events buffered in lanes before pausing dequeue
 
 	// cancel stops the replay when the error policy is Abort (R7.6). It is set
 	// for the duration of Run and invoked by the error-policy decorator via
@@ -135,8 +145,33 @@ func NewReplayerWithHook(cfg Config, q queue.Queue, pool Pool, execHook func(err
 		guard:       sg,
 	}
 	r.configureMode(cfg)
-	r.exec = buildExecutor(cfg, poolExecutor{pool: pool, sessionAffinity: cfg.SessionAffinity}, r.requestAbort, realSleep, sg)
+	baseExec := poolExecutor{pool: pool, sessionAffinity: cfg.SessionAffinity}
+	r.exec = buildExecutor(cfg, baseExec, r.requestAbort, realSleep, sg)
+
+	// Wire the resetExec on the error-policy decorator so that after a skip,
+	// a ROLLBACK is issued to clear the connection's aborted transaction state.
+	// This prevents locks from being held indefinitely on session-affinity
+	// connections after a failed statement.
+	if ep := findErrorPolicyExecutor(r.exec); ep != nil {
+		ep.resetExec = baseExec
+	}
 	return r
+}
+
+// findErrorPolicyExecutor traverses the executor decorator chain to find the
+// errorPolicyExecutor. Returns nil if not found.
+func findErrorPolicyExecutor(ex Executor) *errorPolicyExecutor {
+	switch e := ex.(type) {
+	case *errorPolicyExecutor:
+		return e
+	case *rateLimitExecutor:
+		return findErrorPolicyExecutor(e.next)
+	case *pacingExecutor:
+		return findErrorPolicyExecutor(e.next)
+	case *replayguardExecutor:
+		return findErrorPolicyExecutor(e.next)
+	}
+	return nil
 }
 
 // requestAbort stops an in-flight replay by cancelling the run context. It is
@@ -204,6 +239,13 @@ func (r *replayer) configureMode(cfg Config) {
 	if r.concurrency < 1 {
 		r.concurrency = 1
 	}
+
+	// Wire the max lane depth. When 0 (unconfigured), use the default so the
+	// dispatcher always has OOM protection regardless of replayguard presence.
+	r.maxLaneDepth = cfg.MaxLaneDepth
+	if r.maxLaneDepth <= 0 {
+		r.maxLaneDepth = defaultMaxLaneDepth
+	}
 }
 
 // Run consumes SQL_Events from the queue and replays them, returning when the
@@ -238,28 +280,27 @@ func (r *replayer) Run(ctx context.Context) error {
 
 dispatch:
 	for {
-		// Backpressure check (#10): pause dequeue when queue depth or replay lag
-		// exceeds configured thresholds. This prevents the replayer from falling
-		// further behind by slowing consumption, giving the target DB time to
-		// recover. The upstream Buffer_Queue continues to accept production
-		// events (with overflow policy) so production is never blocked (R7.7).
-		// The lane depth is included so that unbounded lane buffers cannot grow
-		// without limit when the target is slow or locks cause stalls.
-		if r.guard != nil {
-			laneDepth := 0
-			for _, l := range lanes {
-				laneDepth += l.Len()
-			}
-			for r.guard.CheckBackpressure(r.q.Depth()+laneDepth, 0) {
-				select {
-				case <-ctx.Done():
-					break dispatch
-				case <-time.After(100 * time.Millisecond):
-					// Re-check after a brief pause; recompute lane depth.
-					laneDepth = 0
-					for _, l := range lanes {
-						laneDepth += l.Len()
-					}
+		// Backpressure check: pause dequeue when total lane buffer depth exceeds
+		// the configured maximum. This prevents OOM even when no replayguard is
+		// configured — events stay in the upstream queue (ring/file/kafka) which
+		// handles overflow per its own policy. Production traffic is never
+		// affected because capture→queue is independent of replay consumption.
+		//
+		// When a replayguard IS configured, it additionally checks queue depth
+		// and replay lag thresholds for more granular control.
+		laneDepth := 0
+		for _, l := range lanes {
+			laneDepth += l.Len()
+		}
+
+		for laneDepth >= r.maxLaneDepth || (r.guard != nil && r.guard.CheckBackpressure(r.q.Depth()+laneDepth, 0)) {
+			select {
+			case <-ctx.Done():
+				break dispatch
+			case <-time.After(100 * time.Millisecond):
+				laneDepth = 0
+				for _, l := range lanes {
+					laneDepth += l.Len()
 				}
 			}
 		}

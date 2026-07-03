@@ -4,11 +4,15 @@ pgshadow_new
 pgshadow_ebpf
 *.exe
 
+# eBPF compiled objects (generated via go generate)
+pkg/capture/*.o
+
 # Config with secrets
 config.yaml
 
 # OS files
 .DS_Store
+pkg/.DS_Store
 *.swp
 
 # IDE

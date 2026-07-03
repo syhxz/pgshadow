@@ -57,9 +57,19 @@ func (l *unboundedLane) Dequeue() (*core.SQLEvent, bool) {
 		return nil, false
 	}
 	ev := l.buf[0]
-	// Avoid retaining a reference to a potentially large event.
-	l.buf[0] = nil
+	l.buf[0] = nil // avoid retaining a reference to a potentially large event
 	l.buf = l.buf[1:]
+
+	// Shrink the underlying array when it's over-allocated relative to the
+	// current length. After a burst (e.g. target was slow), the buffer may have
+	// grown to 100K+ entries; once drained, the backing array would otherwise
+	// never be freed. Re-allocate when len < cap/4 and cap > a minimum.
+	if cap(l.buf) > 1024 && len(l.buf) < cap(l.buf)/4 {
+		shrunk := make([]*core.SQLEvent, len(l.buf))
+		copy(shrunk, l.buf)
+		l.buf = shrunk
+	}
+
 	l.mu.Unlock()
 	return ev, true
 }

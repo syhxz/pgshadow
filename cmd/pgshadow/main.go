@@ -28,7 +28,7 @@ import (
 
 	"pgshadow/pkg/capture"
 	"pgshadow/pkg/config"
-	"pgshadow/pkg/logger"
+	"pgshadow/internal/logger"
 	"pgshadow/pkg/metrics"
 	"pgshadow/pkg/queue"
 	"pgshadow/pkg/replayer"

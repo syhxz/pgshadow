@@ -15,11 +15,17 @@ import (
 // When source traffic comes from different databases, each is routed to
 // the corresponding target pool.
 type PoolRouter struct {
-	mu       sync.RWMutex
-	pools    map[string]*pgxpool.Pool // database name → pool
-	template PoolConfig              // base config (host, user, password, etc.)
-	closed   bool
+	mu           sync.RWMutex
+	pools        map[string]*pgxpool.Pool // database name → pool
+	template     PoolConfig              // base config (host, user, password, etc.)
+	closed       bool
+	maxDatabases int                      // max pools to create; 0 = default (64)
 }
+
+// defaultMaxDatabases is the maximum number of database-specific pools the
+// router will create. This prevents unbounded connection creation when routing
+// traffic from a large multi-tenant source.
+const defaultMaxDatabases = 64
 
 // PoolConfig is the base connection configuration template.
 // The Database field is replaced per-pool.
@@ -36,8 +42,9 @@ type PoolConfig struct {
 // NewPoolRouter creates a router with the given base config.
 func NewPoolRouter(cfg PoolConfig) *PoolRouter {
 	return &PoolRouter{
-		pools:    make(map[string]*pgxpool.Pool),
-		template: cfg,
+		pools:        make(map[string]*pgxpool.Pool),
+		template:     cfg,
+		maxDatabases: defaultMaxDatabases,
 	}
 }
 
@@ -64,13 +71,23 @@ func (r *PoolRouter) GetPool(ctx context.Context, database string) (*pgxpool.Poo
 		return pool, nil
 	}
 
+	// Enforce pool count limit to prevent unbounded connection creation.
+	maxDB := r.maxDatabases
+	if maxDB <= 0 {
+		maxDB = defaultMaxDatabases
+	}
+	if len(r.pools) >= maxDB {
+		return nil, fmt.Errorf("pool router: max databases reached (%d), cannot create pool for %q", maxDB, database)
+	}
+
 	connStr := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s pool_max_conns=%d pool_min_conns=%d",
-		r.template.Host, r.template.Port, r.template.User, r.template.Password,
-		database, r.template.MaxConns, r.template.MinConns,
+		dsnQuoteRouter(r.template.Host), r.template.Port, dsnQuoteRouter(r.template.User),
+		dsnQuoteRouter(r.template.Password), dsnQuoteRouter(database),
+		r.template.MaxConns, r.template.MinConns,
 	)
 	if r.template.SSLMode != "" {
-		connStr += " sslmode=" + r.template.SSLMode
+		connStr += " sslmode=" + dsnQuoteRouter(r.template.SSLMode)
 	}
 
 	pool, err := pgxpool.New(ctx, connStr)
@@ -124,4 +141,33 @@ type PoolStats struct {
 	Total    int32
 	Acquired int32
 	Idle     int32
+}
+
+// dsnQuoteRouter quotes a DSN value if it contains spaces, quotes, or backslashes
+// per libpq connection string quoting rules.
+func dsnQuoteRouter(s string) string {
+	needsQuote := false
+	for _, c := range s {
+		if c == ' ' || c == '\'' || c == '\\' || c == '=' {
+			needsQuote = true
+			break
+		}
+	}
+	if !needsQuote && s != "" {
+		return s
+	}
+	// Single-quote with internal single-quotes escaped as ''
+	var buf []byte
+	buf = append(buf, '\'')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\'' {
+			buf = append(buf, '\'', '\'')
+		} else if s[i] == '\\' {
+			buf = append(buf, '\\', '\\')
+		} else {
+			buf = append(buf, s[i])
+		}
+	}
+	buf = append(buf, '\'')
+	return string(buf)
 }

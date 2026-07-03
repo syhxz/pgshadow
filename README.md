@@ -26,13 +26,13 @@ Source DB (untouched)
 cp config.example.yaml config.yaml
 vim config.yaml  # set interface, target_host, target_database, target_user
 
-# 2. Set target database password
-export PGSHADOW_TARGET_PASSWORD="your_password"
+# 2. Set target database password (must match password_env in config.yaml)
+export PGSHADOW_DB_PASSWORD="your_password"
 
-# 3. Run (requires CAP_NET_RAW for packet capture)
-sudo ./pgshadow -config config.yaml
+# 3. Run (requires CAP_NET_RAW for packet capture, or root for eBPF)
+sudo -E ./pgshadow -config config.yaml
 
-# Or grant capability without sudo:
+# Or grant capability without sudo (pcap/af_packet mode only):
 sudo setcap cap_net_raw=eip ./pgshadow
 ./pgshadow -config config.yaml
 ```
@@ -62,7 +62,7 @@ See `config.example.yaml` for all options. Key settings:
 | `target_port` | 5432 | Target database port |
 | `target_database` | (required) | Target database name |
 | `target_user` | (required) | Target database user |
-| `password_env` | `PGSHADOW_TARGET_PASSWORD` | Env var name for target password |
+| `password_env` | `PGSHADOW_DB_PASSWORD` | Env var name for target password |
 | `workers` | 32 | Worker goroutines |
 | `speed_factor` | 1.0 | `1.0`=original, `2.0`=2x faster, `0`=ASAP |
 | `session_affinity` | true | Same source ConnID -> same target connection |
@@ -259,6 +259,16 @@ Client → [TLS 1.3 encrypted] → PostgreSQL process
 - BTF enabled (`/sys/kernel/btf/vmlinux`)
 - `CAP_BPF` + `CAP_SYS_ADMIN` (or root)
 - `libssl.so` accessible on the system (auto-detected from PostgreSQL process)
+
+### Building
+
+The `ebpf_ssl` mode requires the `ebpf` build tag:
+
+```bash
+go build -tags ebpf -o pgshadow ./cmd/pgshadow/
+```
+
+Without this tag, `mode: "ebpf_ssl"` will fail at startup with: `ebpf_ssl mode is unavailable in this build; rebuild with -tags ebpf`.
 
 ### Configuration
 
@@ -467,7 +477,7 @@ replayer:
   target_port: 5432
   target_database: "postgres"
   target_user: "dbmgr"
-  password_env: "PGSHADOW_TARGET_PASSWORD"
+  password_env: "PGSHADOW_DB_PASSWORD"
   workers: 128
   speed_factor: 0               # 0 = replay ASAP (no pacing)
   session_affinity: true
@@ -502,8 +512,8 @@ sudo docker run -d --name kafka --network host \
 # 2. Wait for Kafka
 until nc -z localhost 9092; do sleep 1; done
 
-# 3. Set target password
-export PGSHADOW_TARGET_PASSWORD="your_password"
+# 3. Set target password (must match password_env in config.yaml)
+export PGSHADOW_DB_PASSWORD="your_password"
 
 # 4. Start pgshadow (eBPF + Kafka)
 sudo -E ./pgshadow -config config.yaml
@@ -532,44 +542,44 @@ sudo docker stop kafka && sudo docker rm kafka
 
 ---
 
-## Kubernetes / Greenplum 部署指南
+## Kubernetes / Greenplum Deployment Guide
 
-### 部署场景：pgshadow 运行在 GP Master 所在宿主机
+### Deployment Scenario: pgshadow on the GP Master Host
 
-K8s 环境下 GP Master 运行在 Pod 内，客户端流量经过宿主机虚拟网桥到达 Pod。pgshadow 部署在宿主机上即可被动捕获所有进出 GP 的 SQL 流量。
+In a Kubernetes environment, GP Master runs inside a Pod. Client traffic passes through the host's virtual bridge to reach the Pod. Deploy pgshadow on the host node to passively capture all SQL traffic to/from GP.
 
-#### 步骤 1：确认网络接口
+#### Step 1: Identify the Network Interface
 
 ```bash
-# 获取 GP Master Pod IP
+# Get GP Master Pod IP
 kubectl get pod -n <namespace> -l app=greenplum-master -o wide
-# 输出示例: NAME          IP            NODE
-#           gp-master-0   10.244.1.15   worker-node-1
+# Example output: NAME          IP            NODE
+#                 gp-master-0   <GP_POD_IP>   worker-node-1
 
-# 确认流量走哪个网卡（CNI 不同，网卡名不同）
-ip route get 10.244.1.15
-# 输出: 10.244.1.15 dev cali1234abcd src 10.244.1.1
+# Determine which interface carries traffic (varies by CNI)
+ip route get <GP_POD_IP>
+# Output: <GP_POD_IP> dev cali1234abcd src <HOST_IP>
 
-# 常见 CNI 接口名:
+# Common CNI interface names:
 #   Calico:  cali*
 #   Flannel: flannel.1, cni0
 #   Cilium:  cilium_host, lxc*
 #   Bridge:  cbr0, docker0
 
-# 验证能抓到 GP 流量
-sudo tcpdump -i cali1234abcd -nn host 10.244.1.15 and port 5432 -c 5
+# Verify GP traffic is visible
+sudo tcpdump -i cali1234abcd -nn host <GP_POD_IP> and port 5432 -c 5
 ```
 
-#### 步骤 2：配置 pgshadow
+#### Step 2: Configure pgshadow
 
-**指定 Pod IP（精确过滤）：**
+**Filter by Pod IP (precise):**
 
 ```yaml
 capture:
-  interface: "cali1234abcd"   # 连接 GP Pod 的 veth 接口
+  interface: "cali1234abcd"   # veth interface connected to GP Pod
   port: 5432
-  source_host: "10.244.1.15"  # GP Master Pod IP
-  source_port: 5432           # Pod 内 GP 监听端口
+  source_host: "<GP_POD_IP>"  # GP Master Pod IP
+  source_port: 5432           # GP listen port inside the Pod
   mode: "ebpf"
   bidirectional: true
 
@@ -584,62 +594,62 @@ replayer:
   pool_max_conns: 64
 ```
 
-**仅按端口过滤（Pod IP 变化时无需更新配置）：**
+**Filter by port only (no config update needed when Pod IP changes):**
 
 ```yaml
 capture:
-  interface: "cni0"           # 桥接网卡
-  port: 5432                  # 只要宿主机上仅 GP 用 5432 就够了
-  mode: "ebpf"                # 推荐：veth/bridge 上自动回退 generic mode，性能优于 pcap
+  interface: "cni0"           # bridge interface
+  port: 5432                  # works if only GP uses port 5432 on this host
+  mode: "ebpf"               # recommended: falls back to generic mode on veth/bridge
   bidirectional: true
 ```
 
-#### 步骤 3：运行
+#### Step 3: Run
 
 ```bash
 export PGSHADOW_DB_PASSWORD="target_db_password"
 sudo -E ./pgshadow -config config.yaml
 ```
 
-#### 注意事项
+#### Notes
 
-| 事项 | 说明 |
-|------|------|
-| Pod IP 变化 | Pod 重启后 IP 变化，需更新 `source_host`；不配则靠端口过滤 |
-| NodePort 端口映射 | 客户端连 `Node:30432`，DNAT 后 veth 上看到的是 `PodIP:5432` |
-| SSL/TLS | K8s 内部通常无加密，直接抓明文；如启用 SSL 则用 `ebpf_ssl` 模式 |
-| eBPF vs pcap | eBPF XDP 必须指定具体接口，在 veth/bridge 上自动回退 generic mode（性能仍优于 pcap）；pcap 支持 `interface: "any"` |
-| 权限 | eBPF 需 `CAP_BPF + CAP_NET_ADMIN`；pcap 需 `CAP_NET_RAW` |
+| Topic | Details |
+|-------|---------|
+| Pod IP changes | Pod restart assigns new IP; update `source_host` or omit it to filter by port only |
+| NodePort mapping | Client connects to `Node:30432`; after DNAT, veth sees `PodIP:5432` |
+| SSL/TLS | K8s internal traffic is usually unencrypted (use plaintext capture); if SSL is enabled use `ebpf_ssl` mode |
+| eBPF vs pcap | eBPF XDP requires a specific interface; on veth/bridge it auto-falls back to generic mode (still faster than pcap); pcap supports `interface: "any"` |
+| Permissions | eBPF requires `CAP_BPF + CAP_NET_ADMIN`; pcap requires `CAP_NET_RAW` |
 
 ---
 
-### Greenplum 方言详解 (`target_dialect: "greenplum"`)
+### Greenplum Dialect (`target_dialect: "greenplum"`)
 
-设置 `target_dialect: "greenplum"` 后，replayer 自动适配 GP 执行模式：
+When `target_dialect: "greenplum"` is set, the replayer automatically adapts to GP execution semantics:
 
-| 行为 | 说明 |
-|------|------|
-| 跳过事务控制 | BEGIN / COMMIT / ROLLBACK / END / ABORT / START TRANSACTION 不发送到目标 |
-| Autocommit 模式 | 每条 SQL 独立执行，不开启显式事务，避免持有分布式锁 |
-| 仅连接 Master | Replay 只连接目标 GP Master，不做 Segment fan-out |
-| 兼容性 | 基于 PG wire protocol，兼容 GP 6.x / 7.x |
+| Behavior | Description |
+|----------|-------------|
+| Skip transaction control | BEGIN / COMMIT / ROLLBACK / END / ABORT / START TRANSACTION are not sent to the target |
+| Autocommit mode | Each SQL statement executes independently, no explicit transactions, avoids holding distributed locks |
+| Master-only connection | Replay connects only to the target GP Master; no segment fan-out |
+| Compatibility | Based on PG wire protocol; compatible with GP 6.x / 7.x |
 
-**为什么跳过事务控制？**
+**Why skip transaction control?**
 
-在 Greenplum 中，显式 BEGIN 会在 Master 上开启分布式事务，并在所有涉及的 Segment 上持有锁直到 COMMIT/ROLLBACK。对于 replay 场景，这会导致大量不必要的跨 Segment 锁竞争。跳过事务控制后，每条语句以 autocommit 执行，与 GP 推荐的高吞吐执行模式一致。
+In Greenplum, an explicit BEGIN opens a distributed transaction on the Master and holds locks across all involved Segments until COMMIT/ROLLBACK. For replay scenarios, this causes unnecessary cross-segment lock contention. Skipping transaction control lets each statement execute in autocommit mode, consistent with GP's recommended high-throughput execution pattern.
 
-**配置示例（完整 GP replay）：**
+**Full GP replay configuration example:**
 
 ```yaml
 capture:
   interface: "eth0"
   port: 5432
-  source_host: "10.244.1.15"
+  source_host: "<GP_POD_IP>"
   mode: "ebpf"
   bidirectional: true
 
 filter:
-  mode: "all"                 # 或 "write_only" 只 replay 写操作
+  mode: "all"                 # or "write_only" to replay writes only
 
 queue:
   type: "kafka"

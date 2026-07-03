@@ -194,6 +194,8 @@ func (q *fileQueue) Enqueue(ev *core.SQLEvent) (dropped bool) {
 	payload, err := encodeBinary(ev, q.encodeBuf)
 	if err != nil {
 		q.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "pgshadow: ERROR filequeue: encode event failed (conn=%v seq=%d): %v (event dropped)\n",
+			ev.Conn, ev.Seq, err)
 		return true
 	}
 	q.encodeBuf = payload // retain the backing array for next call
@@ -289,19 +291,40 @@ func (q *fileQueue) Dequeue(ctx context.Context) (*core.SQLEvent, bool) {
 
 	n, err := q.readLenAt(q.readOff)
 	if err != nil {
-		return nil, false
+		// IO error reading frame header. Skip this frame by advancing past the
+		// minimum header so the queue doesn't get stuck in an infinite loop.
+		// The event is lost, but the queue remains operational.
+		fmt.Fprintf(os.Stderr, "pgshadow: ERROR filequeue: read frame header at offset %d: %v (skipping)\n", q.readOff, err)
+		q.readOff += frameHeaderLen
+		q.count--
+		q.cond.Broadcast()
+		return q.Dequeue(ctx)
 	}
 	if n > maxFramePayload {
-		// Corrupt or tampered frame — refuse to allocate an excessive buffer.
-		return nil, false
+		// Corrupt or tampered frame — skip it rather than blocking the queue.
+		fmt.Fprintf(os.Stderr, "pgshadow: ERROR filequeue: frame at offset %d has excessive length %d (skipping)\n", q.readOff, n)
+		q.readOff += frameHeaderLen + int64(n)
+		q.count--
+		q.cond.Broadcast()
+		return q.Dequeue(ctx)
 	}
 	payload := make([]byte, n)
 	if _, err := q.f.ReadAt(payload, q.readOff+frameHeaderLen); err != nil {
-		return nil, false
+		// IO error reading payload. Skip this frame.
+		fmt.Fprintf(os.Stderr, "pgshadow: ERROR filequeue: read payload at offset %d (len=%d): %v (skipping)\n", q.readOff, n, err)
+		q.readOff += frameHeaderLen + int64(n)
+		q.count--
+		q.cond.Broadcast()
+		return q.Dequeue(ctx)
 	}
 	ev, err := decodeEvent(payload)
 	if err != nil {
-		return nil, false
+		// Corrupt event data. Skip and continue.
+		fmt.Fprintf(os.Stderr, "pgshadow: ERROR filequeue: decode event at offset %d: %v (skipping)\n", q.readOff, err)
+		q.readOff += frameHeaderLen + int64(n)
+		q.count--
+		q.cond.Broadcast()
+		return q.Dequeue(ctx)
 	}
 
 	q.readOff += frameHeaderLen + int64(n)

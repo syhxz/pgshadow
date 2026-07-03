@@ -277,6 +277,7 @@ func (q *kafkaQueue) writeBatchWithRetry(batch []kafka.Message) writeResult {
 }
 
 // retryWithBackoff attempts to write the batch with retries and exponential backoff.
+// It aborts early when the queue is closing so Close() is not blocked for 10+ seconds.
 func (q *kafkaQueue) retryWithBackoff(batch []kafka.Message, maxRetries int) error {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -284,6 +285,14 @@ func (q *kafkaQueue) retryWithBackoff(batch []kafka.Message, maxRetries int) err
 			// Exponential backoff: 100ms, 200ms, 400ms
 			backoff := time.Duration(100<<uint(attempt-1)) * time.Millisecond
 			time.Sleep(backoff)
+
+			// Abort if queue is closing — don't hold up Close() with retries.
+			q.mu.Lock()
+			closed := q.closed
+			q.mu.Unlock()
+			if closed {
+				return lastErr
+			}
 		}
 
 		err := q.writer.WriteMessages(context.Background(), batch...)
@@ -291,7 +300,7 @@ func (q *kafkaQueue) retryWithBackoff(batch []kafka.Message, maxRetries int) err
 			return nil
 		}
 		lastErr = err
-		
+
 		// Check if error is retriable
 		if !isRetriableKafkaError(err) {
 			break
@@ -493,19 +502,22 @@ func (q *kafkaQueue) Enqueue(ev *core.SQLEvent) (dropped bool) {
 		q.mu.Unlock()
 		return false
 	}
-	q.mu.Unlock()
 
 	msg, err := kafkaMessage(ev)
 	if err != nil {
+		q.mu.Unlock()
 		q.recordOverflow()
 		return true
 	}
 
-	// Non-blocking send to the local buffer. If full, drop and record overflow.
+	// Non-blocking send to the local buffer while holding the lock, so Close
+	// cannot close the channel between our closed-check and the send.
 	select {
 	case q.msgCh <- msg:
+		q.mu.Unlock()
 		return false
 	default:
+		q.mu.Unlock()
 		q.recordOverflow()
 		return true
 	}
@@ -523,21 +535,54 @@ func (q *kafkaQueue) Dequeue(ctx context.Context) (*core.SQLEvent, bool) {
 	}
 	q.mu.Unlock()
 
-	msg, err := q.reader.ReadMessage(ctx)
-	if err != nil {
-		// Context cancellation, reader closed, or a transient read error.
-		return nil, false
-	}
+	// maxConsecutiveDecodeErrors is the circuit-breaker threshold: if this many
+	// consecutive messages fail to decode, Dequeue returns (nil, false) to stop
+	// the replay loop. This indicates a systemic issue (codec version mismatch,
+	// topic corruption) rather than isolated bad messages, and continuing would
+	// silently discard a large fraction of traffic.
+	const maxConsecutiveDecodeErrors = 50
 
-	ev, err := decodeEvent(msg.Value)
-	if err != nil {
-		// A corrupt message cannot be surfaced; skip it. The offset is already
-		// committed by the group reader, so the next Dequeue advances.
-		return nil, false
-	}
+	consecutiveErrors := 0
 
-	atomic.AddInt64(&q.consumed, 1)
-	return ev, true
+	for {
+		msg, err := q.reader.ReadMessage(ctx)
+		if err != nil {
+			// Context cancellation, reader closed, or a transient read error.
+			return nil, false
+		}
+
+		ev, err := decodeEvent(msg.Value)
+		if err != nil {
+			consecutiveErrors++
+
+			// Rate-limited logging: log first, every 10th, and the final one
+			// before circuit-break to avoid log storms.
+			if consecutiveErrors == 1 || consecutiveErrors%10 == 0 || consecutiveErrors >= maxConsecutiveDecodeErrors {
+				fmt.Fprintf(os.Stderr,
+					"pgshadow: ERROR [%s] kafka dequeue: corrupt message #%d "+
+						"(partition=%d offset=%d size=%d): %v\n",
+					time.Now().Format("2006-01-02T15:04:05.000Z07:00"),
+					consecutiveErrors, msg.Partition, msg.Offset, len(msg.Value), err)
+			}
+
+			if consecutiveErrors >= maxConsecutiveDecodeErrors {
+				fmt.Fprintf(os.Stderr,
+					"pgshadow: FATAL [%s] kafka dequeue: %d consecutive decode failures — "+
+						"circuit breaker tripped, stopping consumer (likely codec version mismatch)\n",
+					time.Now().Format("2006-01-02T15:04:05.000Z07:00"),
+					consecutiveErrors)
+				return nil, false
+			}
+
+			atomic.AddInt64(&q.consumed, 1)
+			continue
+		}
+
+		// Successful decode resets the circuit breaker.
+		consecutiveErrors = 0
+		atomic.AddInt64(&q.consumed, 1)
+		return ev, true
+	}
 }
 
 // Depth approximates the number of buffered events as produced-minus-consumed

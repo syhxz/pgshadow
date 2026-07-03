@@ -46,6 +46,7 @@ import (
 
 	"pgshadow/pkg/core"
 	"pgshadow/pkg/filter"
+	"pgshadow/pkg/pipeline"
 	"pgshadow/pkg/protocol"
 )
 
@@ -204,7 +205,7 @@ func TestProductionIsolationProperty(t *testing.T) {
 			rec := &p1RecordingDialer{}
 
 			q := &recordingQueue{}
-			sp, err := newStreamProcessor(protocol.Config{ExtendedQuery: true}, filter.Config{}, q, nil)
+			sp, err := pipeline.NewStreamProcessor(protocol.Config{ExtendedQuery: true}, filter.Config{}, q, nil)
 			if err != nil {
 				return false
 			}

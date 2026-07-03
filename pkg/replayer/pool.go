@@ -97,16 +97,28 @@ func (a *affinityPool) acquireFor(ctx context.Context, conn core.ConnID) (connHa
 
 	if existing != nil {
 		if err := existing.Ping(ctx); err == nil {
-			return existing, nil
+			// Re-check under lock: if the lease was released (or replaced) during
+			// the Ping, do NOT return this handle — it may have been handed to
+			// another ConnID by the pool. Fall through to acquire a fresh one.
+			a.mu.Lock()
+			if a.leases[conn] == existing {
+				a.mu.Unlock()
+				return existing, nil
+			}
+			a.mu.Unlock()
+			// The lease was released/replaced during Ping; we must not use it.
+			// Do NOT call existing.Release() here — whoever removed it from
+			// leases already released it. Fall through to acquire a new one.
+		} else {
+			// Dead connection: discard it and acquire a replacement (R9.5).
+			a.mu.Lock()
+			// Only delete if the lease hasn't been replaced by a concurrent call.
+			if a.leases[conn] == existing {
+				delete(a.leases, conn)
+			}
+			a.mu.Unlock()
+			existing.Release()
 		}
-		// Dead connection: discard it and acquire a replacement (R9.5).
-		a.mu.Lock()
-		// Only delete if the lease hasn't been replaced by a concurrent call.
-		if a.leases[conn] == existing {
-			delete(a.leases, conn)
-		}
-		a.mu.Unlock()
-		existing.Release()
 	}
 
 	// Acquire outside the lock so a blocking source (exhausted at max, R9.6)
@@ -227,7 +239,11 @@ var _ Pool = (*ConnPool)(nil)
 // target password is read only from the environment variable named by
 // cfg.PasswordEnv (R11.8); it is never taken from a plaintext field.
 func NewPool(ctx context.Context, cfg Config) (*ConnPool, error) {
-	poolCfg, err := pgxpool.ParseConfig(buildDSN(cfg))
+	dsn, err := buildDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+	poolCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target connection config: %w", err)
 	}
@@ -270,8 +286,11 @@ func (p *ConnPool) AcquireFor(ctx context.Context, conn core.ConnID) (*pgxpool.C
 	if err != nil {
 		return nil, err
 	}
-	// The production source only ever yields *pgxLease.
-	return h.(*pgxLease).conn, nil
+	lease, ok := h.(*pgxLease)
+	if !ok {
+		return nil, fmt.Errorf("pool: unexpected lease type %T for conn %v", h, conn)
+	}
+	return lease.conn, nil
 }
 
 // Release frees the connection leased for conn (R7.5).
@@ -325,7 +344,7 @@ func validatePasswordEnvName(name string) error {
 //
 // Security: The password environment variable name is validated to prevent
 // accidental exposure of common cloud/service credentials.
-func buildDSN(cfg Config) string {
+func buildDSN(cfg Config) (string, error) {
 	host := cfg.TargetHost
 	if host == "" {
 		host = "localhost"
@@ -342,16 +361,14 @@ func buildDSN(cfg Config) string {
 		dsn += " user=" + dsnQuote(cfg.TargetUser)
 	}
 	if cfg.PasswordEnv != "" {
+		if err := validatePasswordEnvName(cfg.PasswordEnv); err != nil {
+			return "", fmt.Errorf("password_env security check failed: %w", err)
+		}
 		if pw := os.Getenv(cfg.PasswordEnv); pw != "" {
-			// Validate the password env name for security
-			if err := validatePasswordEnvName(cfg.PasswordEnv); err != nil {
-				// Log the security concern but don't block - the env var just might not exist
-				// In production, the password must be set, so this will fail at the actual connection
-			}
 			dsn += " password=" + dsnQuote(pw)
 		}
 	}
-	return dsn
+	return dsn, nil
 }
 
 // dsnQuote quotes a libpq connection-string value. Values that contain spaces,
@@ -361,7 +378,7 @@ func buildDSN(cfg Config) string {
 func dsnQuote(s string) string {
 	needsQuote := false
 	for _, c := range s {
-		if c == ' ' || c == '\'' || c == '\\' || c == '\t' || c == '\n' {
+		if c == ' ' || c == '\'' || c == '\\' || c == '\t' || c == '\n' || c == ':' || c == '=' {
 			needsQuote = true
 			break
 		}

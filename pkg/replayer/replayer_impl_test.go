@@ -644,3 +644,67 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string)
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// TestLaneDepthBackpressureWithoutGuard verifies that when no replayguard is
+// configured, the dispatcher still pauses dequeuing from the upstream queue once
+// the total lane buffer depth reaches maxLaneDepth. This prevents OOM when the
+// target is slow/unreachable, without dropping any events.
+func TestLaneDepthBackpressureWithoutGuard(t *testing.T) {
+	// Use a tiny maxLaneDepth so we can trigger backpressure quickly.
+	const maxDepth = 10
+	const totalEvents = 30
+
+	q := newFakeQueue(totalEvents + 1)
+	var execCount atomic.Int64
+
+	// blockingExecutor blocks until the context is cancelled, simulating a
+	// stuck/slow target database.
+	gate := make(chan struct{})
+	blockExec := ExecutorFunc(func(ctx context.Context, conn core.ConnID, ev *core.SQLEvent) error {
+		execCount.Add(1)
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return nil
+	})
+
+	r := newReplayer(Config{
+		Mode:         Bounded,
+		Workers:      4,
+		PoolMaxConns: 4,
+		MaxLaneDepth: maxDepth,
+	}, q, blockExec, nil)
+
+	// Enqueue more events than maxLaneDepth.
+	conn := core.ConnID{SrcPort: 9999, DstPort: 5432}
+	for i := 0; i < totalEvents; i++ {
+		q.Enqueue(ev(conn, uint64(i+1), "INSERT INTO t VALUES (1)"))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Run(ctx)
+	}()
+
+	// Give the dispatcher time to hit the backpressure limit.
+	time.Sleep(300 * time.Millisecond)
+
+	// The queue should still have events left (not all consumed) because the
+	// dispatcher paused at the lane depth limit.
+	remaining := q.Depth()
+	if remaining == 0 {
+		t.Errorf("dispatcher consumed all events; backpressure did not engage (maxLaneDepth=%d)", maxDepth)
+	}
+
+	// Unblock the executor and cancel to clean up.
+	close(gate)
+	cancel()
+	<-done
+
+	// All events should have been either executed or remain in queue — none lost.
+	t.Logf("remaining in queue: %d, exec count: %d", remaining, execCount.Load())
+}

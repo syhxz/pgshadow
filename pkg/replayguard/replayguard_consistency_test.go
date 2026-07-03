@@ -9,7 +9,7 @@ import (
 )
 
 // =============================================================================
-// Issue #6: SERIAL/IDENTITY 序列 ID 冲突 — safeguard.rewrite_sequences
+// Issue #6: SERIAL/IDENTITY sequence ID conflicts — safeguard.rewrite_sequences
 // The shadow DB has independent sequences. nextval()/currval()/lastval()
 // should execute normally on the shadow DB without rewriting.
 // The RewriteSequences option is reserved for future hardcoded-ID handling.
@@ -63,7 +63,7 @@ func TestRewriteSequences_Disabled(t *testing.T) {
 }
 
 // =============================================================================
-// Issue #7: now()/current_timestamp 时间不一致 — safeguard.rewrite_time_functions
+// Issue #7: now()/current_timestamp time inconsistency — safeguard.rewrite_time_functions
 // =============================================================================
 
 func TestRewriteTimeFunctions_AllVariants(t *testing.T) {
@@ -274,7 +274,7 @@ func TestRewriteTimeFunctions_MixedRealAndStringLiteral(t *testing.T) {
 }
 
 // =============================================================================
-// Issue #8: random()/gen_random_uuid() 不可重放 — 永远原样重放
+// Issue #8: random()/gen_random_uuid() non-reproducible — always replayed as-is
 // Non-deterministic functions are always replayed as-is. Skipping them would
 // cause missing rows and cascading failures on the shadow DB.
 // =============================================================================

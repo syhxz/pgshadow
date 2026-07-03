@@ -282,7 +282,13 @@ func isIdentPart(c byte) bool {
 // of string and dollar-quoted literals. The returned slice is borrowed from a
 // pool and must be returned via putTokens when no longer needed.
 func lex(sql string) []token {
-	toks := tokPool.Get().([]token)[:0]
+	v := tokPool.Get()
+	var toks []token
+	if v != nil {
+		toks = v.([]token)[:0]
+	} else {
+		toks = make([]token, 0, 32)
+	}
 	i, n := 0, len(sql)
 	for i < n {
 		c := sql[i]

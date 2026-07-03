@@ -12,7 +12,6 @@ package metrics
 import (
 	"fmt"
 	"net/http"
-	"sort"
 	"sync"
 	"time"
 
@@ -312,39 +311,6 @@ func (c *collector) Throughput(sourceQPS, targetQPS float64) {
 	c.targetQPS.Set(targetQPS)
 }
 
-// healthState holds the current health state of the application.
-type healthState struct {
-	mu         sync.RWMutex
-	ready      bool
-	lastError  string
-}
-
-// SetReady sets the ready state of the application.
-func (h *healthState) SetReady(ready bool, errMsg string) {
-	h.mu.Lock()
-	h.ready = ready
-	h.lastError = errMsg
-	h.mu.Unlock()
-}
-
-// IsReady returns the current ready state.
-func (h *healthState) IsReady() (bool, string) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.ready, h.lastError
-}
-
-// globalHealth holds the global health state for the collector.
-// This is used for the /health and /ready endpoints.
-var globalHealth healthState
-
-// SetHealthStatus sets the global health status for the /health and /ready endpoints.
-// ready should be true when all components are initialized and the application
-// is ready to process traffic.
-func SetHealthStatus(ready bool, errMsg string) {
-	globalHealth.SetReady(ready, errMsg)
-}
-
 // Serve starts an HTTP server exposing the Prometheus catalog at /metrics, 
 // plus health check endpoints at /health and /ready. A non-positive port 
 // defaults to 9090 (R10.1). It blocks until the server stops.
@@ -371,31 +337,6 @@ func (c *collector) Serve(port int) error {
 		Handler: mux,
 	}
 	return srv.ListenAndServe()
-}
-
-// healthHandler handles the /health liveness probe.
-// Returns 200 OK when the service is running.
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
-}
-
-// readyHandler handles the /ready readiness probe.
-// Returns 200 OK when the service is ready to process traffic.
-// Returns 503 Service Unavailable when not ready.
-func readyHandler(w http.ResponseWriter, r *http.Request) {
-	ready, errMsg := globalHealth.IsReady()
-	if ready {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if errMsg != "" {
-			w.Write([]byte(errMsg))
-		} else {
-			w.Write([]byte("Not ready"))
-		}
-	}
 }
 
 // handler returns the /metrics HTTP handler bound to this collector's registry.
@@ -445,59 +386,4 @@ func className(class filter.StmtClass) string {
 	default:
 		return "unknown"
 	}
-}
-
-// reservoir is a bounded ring of recent samples used to estimate quantiles for
-// the p99 alert comparison (R10.5) without unbounded memory growth.
-type reservoir struct {
-	buf  []float64
-	size int
-	next int
-	full bool
-}
-
-func newReservoir(size int) *reservoir {
-	if size <= 0 {
-		size = 1
-	}
-	return &reservoir{buf: make([]float64, 0, size), size: size}
-}
-
-func (r *reservoir) add(v float64) {
-	if !r.full {
-		r.buf = append(r.buf, v)
-		if len(r.buf) == r.size {
-			r.full = true
-			r.next = 0
-		}
-		return
-	}
-	r.buf[r.next] = v
-	r.next = (r.next + 1) % r.size
-}
-
-// quantile returns the requested quantile (q in [0,1]) of the current samples
-// using nearest-rank, or 0 when there are no samples.
-func (r *reservoir) quantile(q float64) float64 {
-	n := len(r.buf)
-	if n == 0 {
-		return 0
-	}
-	cp := make([]float64, n)
-	copy(cp, r.buf)
-	sort.Float64s(cp)
-	if q <= 0 {
-		return cp[0]
-	}
-	if q >= 1 {
-		return cp[n-1]
-	}
-	idx := int(q*float64(n-1) + 0.5)
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= n {
-		idx = n - 1
-	}
-	return cp[idx]
 }

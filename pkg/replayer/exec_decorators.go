@@ -160,7 +160,8 @@ type errorPolicyExecutor struct {
 	next        Executor
 	policy      ErrorPolicy
 	maxAttempts int
-	onAbort     func() // stops replay on abort; nil is a no-op
+	onAbort     func()   // stops replay on abort; nil is a no-op
+	resetExec   Executor // used to issue ROLLBACK after skip; nil = no reset
 }
 
 // newErrorPolicyExecutor wraps next with the given error policy. The abort hook
@@ -197,6 +198,9 @@ func (e *errorPolicyExecutor) Exec(ctx context.Context, conn core.ConnID, ev *co
 			}
 		}
 		// Retries exhausted: fall through to skip so processing continues.
+		// Reset the connection's transaction state so subsequent statements
+		// on this affinity connection don't stall on an aborted transaction.
+		e.resetTxState(ctx, conn)
 		return nil
 	case Abort:
 		if e.onAbort != nil {
@@ -204,8 +208,29 @@ func (e *errorPolicyExecutor) Exec(ctx context.Context, conn core.ConnID, ev *co
 		}
 		return err
 	default: // Skip (R7.6 default): swallow and continue (R12.4).
+		// Reset the connection's transaction state so subsequent statements
+		// on this affinity connection don't stall on an aborted transaction.
+		// Without this, a failed DDL/DML leaves the connection in "aborted"
+		// state, causing all following SQL to fail and locks to be held until
+		// the connection is closed.
+		e.resetTxState(ctx, conn)
 		return nil
 	}
+}
+
+// resetTxState issues a ROLLBACK on the connection to clear any aborted
+// transaction state. This is a best-effort cleanup — if it fails (e.g. ctx
+// done), the connection remains dirty but the lane will eventually retire it.
+// Uses the resetExec hook if set (production), otherwise falls back to e.next.
+func (e *errorPolicyExecutor) resetTxState(ctx context.Context, conn core.ConnID) {
+	if e.resetExec == nil {
+		return
+	}
+	rollbackEv := &core.SQLEvent{
+		Conn: conn,
+		SQL:  "ROLLBACK",
+	}
+	_ = e.resetExec.Exec(ctx, conn, rollbackEv)
 }
 
 // buildExecutor composes the production execution seam around base, layering

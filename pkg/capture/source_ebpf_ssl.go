@@ -74,7 +74,9 @@ type ebpfSSLSource struct {
 	// seqNums tracks per-connection TCP sequence numbers so the reassembler
 	// correctly orders multiple SSL records from the same connection. Only
 	// accessed from the single readLoop goroutine — no lock needed.
-	seqNums map[uint64]uint32 // key: (pid<<32|tid)<<1|direction → next TCP seq number
+	seqNums         map[uint64]uint32 // key: (pid<<32|tid)<<1|direction → next TCP seq number
+	seqLastSeen     map[uint64]uint64 // key → last purge counter value when key was used
+	seqPurgeCounter uint64            // monotonic counter incremented on every nextSeq call
 }
 
 // newEBPFSSLSource creates and starts the SSL uprobe capture source.
@@ -167,6 +169,7 @@ func newEBPFSSLSource(cfg Config, sslCfg SSLConfig) (Source, error) {
 		done:           make(chan struct{}),
 		targetPID:      sslCfg.TargetPID,
 		seqNums:        make(map[uint64]uint32),
+		seqLastSeen:    make(map[uint64]uint64),
 	}
 
 	s.wg.Add(1)
@@ -223,14 +226,41 @@ func (s *ebpfSSLSource) readLoop() {
 // ensures the TCP reassembler sees monotonically increasing sequence numbers
 // and correctly reassembles multiple SSL_read/SSL_write calls on the same
 // connection (critical for Extended Query: Parse→Bind→Execute).
+//
+// To prevent unbounded growth of the seqNums map over long-running processes,
+// entries that haven't been updated for a long time are periodically purged
+// (see purgeStaleSeqs).
 func (s *ebpfSSLSource) nextSeq(pid, tid uint32, direction uint8, dataLen uint32) uint32 {
 	key := (uint64(pid)<<32 | uint64(tid))<<1 | uint64(direction)
-	seq := s.seqNums[key]
-	if seq == 0 {
+	seq, exists := s.seqNums[key]
+	if !exists {
 		seq = 1 // start at 1 like a real TCP connection post-handshake
 	}
+	// seq naturally wraps around at uint32 max, matching real TCP behavior.
+	// The reassembler handles wrap-around correctly via modular arithmetic.
 	s.seqNums[key] = seq + dataLen
+	s.seqLastSeen[key] = s.seqPurgeCounter
+	s.seqPurgeCounter++
+
+	// Purge stale entries every 100K seq operations to bound memory.
+	if s.seqPurgeCounter%100000 == 0 {
+		s.purgeStaleSeqs()
+	}
 	return seq
+}
+
+// purgeStaleSeqs removes seqNums entries that haven't been seen in the last
+// 500K operations. This prevents unbounded map growth from accumulated dead
+// connections over long-running processes.
+func (s *ebpfSSLSource) purgeStaleSeqs() {
+	const staleThreshold uint64 = 500000
+	cutoff := s.seqPurgeCounter - staleThreshold
+	for key, lastSeen := range s.seqLastSeen {
+		if lastSeen < cutoff {
+			delete(s.seqNums, key)
+			delete(s.seqLastSeen, key)
+		}
+	}
 }
 
 // parseSslEvent decodes the raw ring buffer record into an sslEvent.
