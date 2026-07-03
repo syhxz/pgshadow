@@ -1,0 +1,122 @@
+# pgshadow 生产配置示例（含全部安全防护）
+# 本配置解决了以下生产场景问题：
+#   #1  跨主机抓包 - 使用实际网卡 eth0
+#   #4  DDL 过滤 - 保护目标库 schema
+#   #5  Kafka 多 broker - 高可用
+#   #7  时间函数 - 用原始捕获时间替换 now()
+#   #8  随机函数 - 跳过不可重放的 SQL
+#   #9  外部依赖 - 跳过 dblink/FDW/pg_notify
+#   #10 反压 - 队列积压时暂停
+#   #11 大事务 - 超时保护
+#   #14 数据脱敏 - 正则替换敏感数据
+#   #17 进度监控 - 延迟告警
+#   #18 选择性回放 - 按表/百分比过滤
+#   #19 故障转移 - 检测源库切换
+#   #20 结果对比 - 记录 diff 到文件
+
+capture:
+  interface: "eth0"       # 生产环境用实际网卡（#1）
+  port: 5432
+  source_host: "YOUR_SOURCE_DB_IP"  # 源库 IP — 只抓与这个地址通信的流量（#1）
+  # source_port: 5432      # 源库端口（默认同 port）
+  mode: "ebpf"            # 或 "ebpf_ssl" 如果源库开启了 SSL
+  bidirectional: true
+  # target_pid: 0         # ebpf_ssl 模式：0=所有进程
+  # libssl_path: ""       # ebpf_ssl 模式：自动检测
+
+parser:
+  max_sql_length: 1048576
+  timeout_idle_conn: 300
+  extended_query: true
+
+filter:
+  mode: "all"
+  exclude_patterns:
+    - "^SET\\s"           # 跳过 SET 命令
+    - "^DISCARD\\s"       # 跳过 DISCARD
+
+queue:
+  type: "kafka"
+  kafka:
+    brokers:              # 多 broker 高可用 (#5)
+      - "kafka1:9092"
+      - "kafka2:9092"
+      - "kafka3:9092"
+    topic: "pgshadow"
+    # SASL/TLS 配置（托管 Kafka 时启用）
+    # sasl_mechanism: "scram-sha-512"
+    # sasl_username: "pgshadow"
+    # sasl_password_env: "KAFKA_PASSWORD"
+    # tls_enabled: true
+
+replayer:
+  target_host: "target-db.example.com"
+  target_port: 5432
+  target_database: "postgres"
+  target_user: "replay_user"
+  password_env: "PGSHADOW_TARGET_PASSWORD"
+  workers: 64
+  speed_factor: 1.0       # 1.0=原始速度, 0=不限速
+  session_affinity: true
+  error_policy: "skip"
+  replay_concurrency_mode: "bounded"
+  target_dialect: "postgresql"
+  pool_max_conns: 64
+  pool_min_conns: 16
+
+metrics:
+  enabled: true
+  port: 9091
+
+# ═══════════════════════════════════════════════════════════════════
+# 生产安全防护配置
+# ═══════════════════════════════════════════════════════════════════
+safeguard:
+  # DDL 保护 (#4): 阻止 CREATE/ALTER/DROP/TRUNCATE 回放到目标库
+  exclude_ddl: true
+
+  # 时间函数重写 (#7): 将 now()/current_timestamp 替换为捕获时的真实时间
+  rewrite_time_functions: true
+
+  # 非确定性函数 (#8): 跳过含 random()/gen_random_uuid() 的 SQL
+  # 默认 false（正常回放）— 目标库会生成不同的随机值，但保证行数一致
+  # 设为 true 则跳过这些 SQL（目标库会缺数据）
+  skip_non_deterministic: false
+
+  # 外部依赖 (#9): 跳过 dblink/FDW/pg_notify 调用
+  skip_external_deps: true
+
+  # 反压控制 (#10): 当队列积压或延迟过高时暂停捕获
+  max_replay_lag_seconds: 60    # 延迟超过 60s 暂停
+  max_queue_depth: 500000       # 队列超过 50 万暂停
+
+  # 大事务保护 (#11): 单事务超时或超条数时中断
+  max_transaction_duration: "120s"  # 单事务最长 2 分钟
+  max_statements_per_tx: 10000      # 单事务最多 1 万条 SQL
+
+  # 选择性回放 (#18)
+  replay_percentage: 100        # 100=全量, 50=50%流量
+  # include_tables: []          # 只回放这些表（空=不限制）
+  # exclude_tables: ["audit_log", "pg_stat_activity"]  # 排除这些表
+  read_only: false              # true=只回放 SELECT（查询计划验证模式）
+
+  # 数据脱敏 (#14): 正则替换敏感数据
+  mask_patterns:
+    - pattern: "'[0-9]{13,19}'"           # 信用卡号
+      replacement: "'****MASKED****'"
+    - pattern: "'\\+?[0-9]{10,15}'"       # 手机号
+      replacement: "'+86****0000'"
+    # - pattern: "'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}'"
+    #   replacement: "'***@masked.com'"
+
+# ═══════════════════════════════════════════════════════════════════
+# 运维监控配置
+# ═══════════════════════════════════════════════════════════════════
+monitor:
+  # 源库故障转移检测 (#19): 定期检查源库 DNS/IP 是否变化
+  source_host: "source-db.example.com"  # 源库 DNS（非 IP）
+  failover_check_interval: "10s"
+
+  # 结果对比 (#20): 记录目标库的异常到文件
+  diff_output: "/var/log/pgshadow/replay_diffs.log"
+  slow_threshold: 3.0   # 目标比源慢 3 倍以上记录为 SLOW

@@ -1,0 +1,48 @@
+# pgshadow configuration example
+# Copy this file to config.yaml and adjust for your environment.
+
+capture:
+  interface: "eth0"          # network interface to capture (required)
+  port: 5432                 # PostgreSQL port to capture
+  mode: "pcap"              # pcap | af_packet | ebpf
+  bidirectional: true        # capture both client→server and server→client
+
+parser:
+  max_sql_length: 1048576    # max SQL text length (1 MiB), longer statements skipped
+  timeout_idle_conn: 300     # idle connection timeout (seconds)
+  extended_query: true       # parse Extended Query protocol (Parse/Bind/Execute)
+
+filter:
+  mode: "allowlist"          # allowlist | blocklist | passthrough
+
+queue:
+  type: "ringbuffer"         # ringbuffer (in-memory) | file (on-disk WAL) | kafka
+  capacity: 2000000          # max buffered events (default 2000000)
+  overflow: "block"          # drop_oldest | drop_newest | block
+  data_dir: ""               # file queue WAL directory (default: OS temp dir, e.g. /tmp)
+
+replayer:
+  target_host: "127.0.0.1"  # target database host (required)
+  target_port: 5432          # target database port
+  target_database: "mydb"    # target database name (required)
+  target_user: "replay_user" # target database user (required)
+  password_env: "PGSHADOW_DB_PASSWORD"  # env var holding target password (use pgshadow-specific name)
+  workers: 32                # worker goroutines
+  speed_factor: 0            # 0=ASAP (lowest latency), 1.0=original speed, 2.0=2x faster
+  session_affinity: true     # same source ConnID → same target connection
+  error_policy: "skip"       # skip | retry | abort
+  replay_concurrency_mode: "bounded"  # bounded | faithful | serial
+  target_dialect: "postgresql"  # postgresql | greenplum
+  pool_max_conns: 100        # connection pool max size
+  pool_min_conns: 20         # connection pool min size
+
+metrics:
+  enabled: true
+  port: 9090                 # Prometheus metrics HTTP port
+
+# Optional: logging configuration (defaults to info level, text format)
+# Log level: debug, info, warn, error, fatal
+# Log format: text, json
+# environment:
+#   PGSHADOW_LOG_LEVEL: info
+#   PGSHADOW_LOG_FORMAT: text
