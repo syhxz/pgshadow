@@ -54,6 +54,7 @@ import (
 
 	"github.com/google/gopacket"
 
+	"pgshadow/internal/logger"
 	"pgshadow/pkg/capture"
 	"pgshadow/pkg/metrics"
 	"pgshadow/pkg/pipeline"
@@ -94,6 +95,14 @@ type pipelineState struct {
 	consumerCancel context.CancelFunc
 	producerDone   <-chan struct{}
 	consumerDone   <-chan struct{}
+
+	// For failover-driven capture restart (#19).
+	parentCtx context.Context
+	sp        *pipeline.StreamProcessor
+	mu        sync.Mutex
+
+	// For control-plane pause/resume.
+	paused bool
 }
 
 // startPipeline assembles and starts the full pipeline and returns a handle for
@@ -145,7 +154,122 @@ func startPipeline(ctx context.Context, c *components) (*pipelineState, error) {
 		consumerCancel: consumerCancel,
 		producerDone:   producerDone,
 		consumerDone:   consumerDone,
+		parentCtx:      ctx,
+		sp:             sp,
 	}, nil
+}
+
+// restartCapture stops the current capture producer and starts a new one with
+// an updated source_host in the BPF filter. This is called by the failover
+// detector (#19) when the source database's IP changes (e.g. after a
+// primary/standby switchover). The consumer (replayer) is unaffected — it
+// continues draining events from the queue. Only the producer side is recycled.
+//
+// For eBPF/eBPF_SSL modes this is a no-op: those hook local processes and are
+// not IP-dependent. For pcap/af_packet modes, the BPF filter is rebuilt with
+// the new IP and a fresh capture handle is opened.
+func (p *pipelineState) restartCapture(newIP string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	mode := p.c.cfg.Capture.Mode
+	if mode == capture.ModeEBPF || mode == capture.ModeEBPFSSL {
+		// eBPF hooks local processes — IP change is irrelevant.
+		return
+	}
+
+	logger.Infof("failover: restarting capture for new source IP %s (mode=%s)", newIP, mode)
+
+	// Step 1: stop current producer.
+	p.prodCancel()
+	if p.c.capture != nil {
+		_ = p.c.capture.Close()
+	}
+	// Wait for the old producer to finish.
+	<-p.producerDone
+
+	// Step 2: update config with new source host IP and rebuild BPF filter.
+	p.c.cfg.Capture.SourceHost = newIP
+
+	// Step 3: open a new capture handle with the updated filter.
+	newSrc, err := capture.Open(p.c.cfg.Capture)
+	if err != nil {
+		logger.Errorf("failover: cannot reopen capture for %s: %v (will retry on next check)", newIP, err)
+		p.c.capture = nil
+		return
+	}
+	p.c.capture = newSrc
+
+	// Step 4: start a new producer goroutine with the fresh capture source.
+	prodCtx, prodCancel := context.WithCancel(p.parentCtx)
+	p.prodCancel = prodCancel
+	p.producerDone = startProducer(prodCtx, p.c, p.sp)
+
+	// Step 5: restart the metrics poller for the new capture source.
+	go metricsPoller(prodCtx, p.c.capture, p.c.queue, p.c.collector)
+
+	logger.Infof("failover: capture restarted successfully, now monitoring %s", newIP)
+}
+
+// pauseCapture stops the capture producer. The consumer (replayer) continues
+// draining any remaining queued events. Called by the control plane when an
+// external signal requests pgshadow to stop capturing (e.g. this node is no
+// longer the primary).
+func (p *pipelineState) pauseCapture() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.paused {
+		return nil // already paused
+	}
+
+	logger.Info("control: pausing capture producer")
+
+	// Stop the producer goroutines.
+	p.prodCancel()
+	if p.c.capture != nil {
+		_ = p.c.capture.Close()
+		p.c.capture = nil
+	}
+	<-p.producerDone
+
+	p.paused = true
+	logger.Info("control: capture paused")
+	return nil
+}
+
+// resumeCapture restarts the capture producer after a pause. Called by the
+// control plane when an external signal requests pgshadow to start capturing
+// (e.g. this node has been promoted to primary).
+func (p *pipelineState) resumeCapture() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.paused {
+		return nil // already active
+	}
+
+	logger.Info("control: resuming capture producer")
+
+	// Reopen the capture handle with the current config.
+	newSrc, err := capture.Open(p.c.cfg.Capture)
+	if err != nil {
+		logger.Errorf("control: cannot reopen capture: %v", err)
+		return fmt.Errorf("reopen capture: %w", err)
+	}
+	p.c.capture = newSrc
+
+	// Start a new producer.
+	prodCtx, prodCancel := context.WithCancel(p.parentCtx)
+	p.prodCancel = prodCancel
+	p.producerDone = startProducer(prodCtx, p.c, p.sp)
+
+	// Restart the metrics poller.
+	go metricsPoller(prodCtx, p.c.capture, p.c.queue, p.c.collector)
+
+	p.paused = false
+	logger.Info("control: capture resumed")
+	return nil
 }
 
 // drain runs the ordered graceful-shutdown sequence under the default deadline.

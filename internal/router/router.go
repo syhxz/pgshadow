@@ -6,6 +6,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,12 +29,13 @@ type PoolRouter struct {
 const defaultMaxDatabases = 64
 
 // PoolConfig is the base connection configuration template.
-// The Database field is replaced per-pool.
+// The Database field is replaced per-pool. The password is resolved at runtime
+// from the environment variable named by PasswordEnv (never stored in plaintext).
 type PoolConfig struct {
 	Host        string
 	Port        int
 	User        string
-	Password    string
+	PasswordEnv string // environment variable name holding the password
 	MaxConns    int32
 	MinConns    int32
 	SSLMode     string
@@ -81,11 +83,17 @@ func (r *PoolRouter) GetPool(ctx context.Context, database string) (*pgxpool.Poo
 	}
 
 	connStr := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s pool_max_conns=%d pool_min_conns=%d",
+		"host=%s port=%d user=%s dbname=%s pool_max_conns=%d pool_min_conns=%d",
 		dsnQuoteRouter(r.template.Host), r.template.Port, dsnQuoteRouter(r.template.User),
-		dsnQuoteRouter(r.template.Password), dsnQuoteRouter(database),
+		dsnQuoteRouter(database),
 		r.template.MaxConns, r.template.MinConns,
 	)
+	// Resolve password from environment variable at runtime — never store in struct.
+	if r.template.PasswordEnv != "" {
+		if pw := os.Getenv(r.template.PasswordEnv); pw != "" {
+			connStr += " password=" + dsnQuoteRouter(pw)
+		}
+	}
 	if r.template.SSLMode != "" {
 		connStr += " sslmode=" + dsnQuoteRouter(r.template.SSLMode)
 	}

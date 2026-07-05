@@ -64,11 +64,20 @@ type Config struct {
 	Metrics    metrics.Config    `yaml:"metrics"`
 	ReplayGuard ReplayGuardConfig   `yaml:"safeguard"`
 	Monitor    MonitorConfig     `yaml:"monitor"`
+	Control    ControlConfig     `yaml:"control"`
 
 	// TargetPassword is resolved from the environment variable named by
 	// Replayer.PasswordEnv during Load. It is never serialized to or read from
 	// the YAML file (R11.8).
 	TargetPassword string `yaml:"-"`
+}
+
+// ControlConfig configures the external signal-driven control plane.
+// When enabled, pgshadow exposes HTTP endpoints for external orchestration
+// (Patroni, CNPG, K8s hooks, scripts) to activate/pause capture.
+type ControlConfig struct {
+	Enabled bool `yaml:"enabled"` // default false — opt-in
+	Port    int  `yaml:"port"`    // default 9091
 }
 
 // ReplayGuardConfig configures production safeguards.

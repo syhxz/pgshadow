@@ -161,8 +161,11 @@ func newKafkaQueue(cfg KafkaConfig, m *metrics.Collector) (Queue, error) {
 		MaxAttempts:     10,
 		WriteBackoffMin: 250 * time.Millisecond,
 		WriteBackoffMax: 2 * time.Second,
-		// Async mode: WriteMessages returns immediately, flushing in background.
-		Async: true,
+		// Synchronous mode: WriteMessages blocks until the broker acknowledges.
+		// The produceLoop runs in a background goroutine so this does NOT block
+		// the capture pipeline. Using sync mode ensures produce failures are
+		// visible to the retry logic (Async:true silently drops failed writes).
+		Async: false,
 	}
 
 	readerCfg := kafka.ReaderConfig{
@@ -254,7 +257,9 @@ func (q *kafkaQueue) writeBatchWithRetry(batch []kafka.Message) writeResult {
 	}
 
 	// Try full batch first
-	err := q.writer.WriteMessages(context.Background(), batch...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := q.writer.WriteMessages(ctx, batch...)
+	cancel()
 	if err == nil {
 		atomic.AddInt64(&q.produced, int64(len(batch)))
 		return writeResult{}
@@ -295,8 +300,11 @@ func (q *kafkaQueue) retryWithBackoff(batch []kafka.Message, maxRetries int) err
 			}
 		}
 
-		err := q.writer.WriteMessages(context.Background(), batch...)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := q.writer.WriteMessages(ctx, batch...)
+		cancel()
 		if err == nil {
+			atomic.AddInt64(&q.produced, int64(len(batch)))
 			return nil
 		}
 		lastErr = err
@@ -323,20 +331,24 @@ func (q *kafkaQueue) writePartialBatch(batch []kafka.Message) writeResult {
 		right := batch[mid:]
 
 		// Try left half
-		if err := q.writer.WriteMessages(context.Background(), left...); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := q.writer.WriteMessages(ctx, left...); err != nil {
 			// Left failed, add to failed list
 			result.Failed = append(result.Failed, left...)
 		} else {
 			// Left succeeded, clear it from failed tracking
 			left = nil
 		}
+		cancel()
 
 		// Try right half
-		if err := q.writer.WriteMessages(context.Background(), right...); err != nil {
+		ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+		if err := q.writer.WriteMessages(ctx, right...); err != nil {
 			result.Failed = append(result.Failed, right...)
 		} else {
 			right = nil
 		}
+		cancel()
 
 		// If partial success, retry the failed messages individually
 		if len(result.Failed) > 0 && len(result.Failed) < len(batch) {
@@ -345,16 +357,20 @@ func (q *kafkaQueue) writePartialBatch(batch []kafka.Message) writeResult {
 			
 			// Retry remaining messages one by one
 			for _, msg := range remaining {
-				if err := q.writer.WriteMessages(context.Background(), msg); err != nil {
+				ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+				if err := q.writer.WriteMessages(ctx, msg); err != nil {
 					result.Failed = append(result.Failed, msg)
 				}
+				cancel()
 			}
 		}
 	} else {
 		// Single message - just retry once
-		if err := q.writer.WriteMessages(context.Background(), batch[0]); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := q.writer.WriteMessages(ctx, batch[0]); err != nil {
 			result.Failed = append(result.Failed, batch[0])
 		}
+		cancel()
 	}
 
 	result.FailedCount = len(result.Failed)

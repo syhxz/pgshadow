@@ -115,15 +115,22 @@ func (p *streamParser) Feed(data []byte) ([]core.PGMessage, error) {
 
 // compact drops the consumed prefix's backing array so a fully drained stream
 // does not retain a large buffer, and copies any leftover bytes into a fresh
-// slice to avoid pinning an oversized backing array across Feed calls.
+// slice when the backing array is significantly over-allocated to avoid pinning
+// memory across Feed calls. A moderate over-allocation is tolerated to reduce
+// GC pressure in the high-throughput hot path.
 func (p *streamParser) compact() {
 	if len(p.buf) == 0 {
 		p.buf = nil
 		return
 	}
-	leftover := make([]byte, len(p.buf))
-	copy(leftover, p.buf)
-	p.buf = leftover
+	// Only reallocate when the backing array is 4x larger than needed and above
+	// a minimum threshold. This avoids a copy on every Feed call while still
+	// releasing memory after large messages are framed.
+	if cap(p.buf) > 4096 && cap(p.buf) > 4*len(p.buf) {
+		leftover := make([]byte, len(p.buf))
+		copy(leftover, p.buf)
+		p.buf = leftover
+	}
 }
 
 // frameTyped attempts to frame one typed message (type byte + 4-byte length +

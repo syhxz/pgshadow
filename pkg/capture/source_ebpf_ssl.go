@@ -292,14 +292,26 @@ func parseSslEvent(raw []byte) sslEvent {
 // reassembler correctly orders multiple SSL_read/SSL_write calls (required for
 // Extended Query protocol: Parse→Bind→Execute arrive as separate SSL records).
 func (s *ebpfSSLSource) buildSyntheticPacket(payload []byte, direction uint8, pid, tid uint32, tsNs uint64, seq uint32) gopacket.Packet {
-	// Synthetic addresses — use PID/TID as port to differentiate connections
-	srcPort := uint16(tid & 0xFFFF)
-	dstPort := uint16(5432)
-	srcIP := net.IPv4(127, 0, 0, 1)
+	// Synthetic addresses — use PID+FD combined hash to differentiate connections.
+	// Previously only tid&0xFFFF was used, which caused collisions when multiple
+	// TIDs shared the same low 16 bits (different connections got identical
+	// four-tuples, corrupting reassembly). Now we mix pid and tid into both the
+	// IP address and source port to ensure uniqueness across connections.
+	//
+	// Encoding: SrcIP encodes the PID (10.pid_hi.pid_lo.tid_hi), SrcPort
+	// encodes the low 16 bits of TID. This gives a unique four-tuple per
+	// (PID, TID) pair without requiring an explicit mapping table.
+	srcIP := net.IPv4(10, byte(pid>>8), byte(pid), byte(tid>>16))
 	dstIP := net.IPv4(127, 0, 0, 1)
+	srcPort := uint16(tid & 0xFFFF)
+	if srcPort == 5432 {
+		srcPort = 5433 // avoid collision with dstPort
+	}
+	dstPort := uint16(5432)
 
 	if direction == 1 { // write = server→client
 		srcPort, dstPort = dstPort, srcPort
+		srcIP, dstIP = dstIP, srcIP
 	}
 
 	// Build the packet layers

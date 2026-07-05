@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -28,7 +29,9 @@ import (
 
 	"pgshadow/pkg/capture"
 	"pgshadow/pkg/config"
+	"pgshadow/internal/control"
 	"pgshadow/internal/logger"
+	"pgshadow/internal/monitor"
 	"pgshadow/pkg/metrics"
 	"pgshadow/pkg/queue"
 	"pgshadow/pkg/replayer"
@@ -259,6 +262,57 @@ func run(ctx context.Context, args []string, stderr io.Writer, d deps) error {
 	p, err := startPipeline(ctx, c)
 	if err != nil {
 		return err
+	}
+
+	// ── Control Plane ────────────────────────────────────────────────────────
+	// When enabled, expose HTTP endpoints for external orchestration to
+	// activate/pause capture. The callbacks wire into the pipeline's
+	// pauseCapture/resumeCapture so external systems (Patroni, CNPG, scripts)
+	// can control the capture lifecycle without pgshadow understanding the
+	// deployment topology.
+	if c.cfg.Control.Enabled {
+		ctrlSrv := control.New(control.Callbacks{
+			OnActivate: func() error { return p.resumeCapture() },
+			OnPause:    func() error { return p.pauseCapture() },
+		})
+		port := c.cfg.Control.Port
+		if port <= 0 {
+			port = control.DefaultPort
+		}
+		go func() {
+			if serveErr := ctrlSrv.Serve(port); serveErr != nil && serveErr != http.ErrServerClosed {
+				logger.Warnf("control plane stopped: %v", serveErr)
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = ctrlSrv.Shutdown(shutdownCtx)
+		}()
+	}
+
+	// Start failover detector (#19) when monitor.source_host is configured. It
+	// periodically resolves the DNS name and, on IP change (indicating a
+	// primary/standby switchover), restarts the capture producer with the new
+	// IP's BPF filter so pgshadow automatically re-attaches to the new primary.
+	if c.cfg.Monitor.SourceHost != "" {
+		checkInterval := 10 * time.Second
+		if c.cfg.Monitor.FailoverCheckInterval != "" {
+			if d, err := time.ParseDuration(c.cfg.Monitor.FailoverCheckInterval); err == nil && d > 0 {
+				checkInterval = d
+			}
+		}
+		fd := monitor.NewFailoverDetector(
+			c.cfg.Monitor.SourceHost,
+			c.cfg.Capture.Port,
+			checkInterval,
+			func(oldIP, newIP string) {
+				logger.Warnf("failover detected: source IP changed %s → %s, restarting capture", oldIP, newIP)
+				p.restartCapture(newIP)
+			},
+		)
+		fd.Start()
+		defer fd.Stop()
 	}
 
 	// Block until a shutdown signal cancels ctx (SIGINT/SIGTERM, installed in

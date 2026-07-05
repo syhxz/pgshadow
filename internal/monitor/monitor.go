@@ -252,6 +252,7 @@ type ResultComparator struct {
 	mu      sync.Mutex
 	diffs   []Diff
 	maxDiffs int
+	closed   bool
 
 	// Thresholds
 	slowThreshold float64 // multiplier: target > source * threshold → DiffSlower
@@ -292,6 +293,12 @@ func (rc *ResultComparator) Record(r ReplayResult) {
 	}
 
 	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	if rc.closed {
+		return
+	}
+
 	if len(rc.diffs) < rc.maxDiffs {
 		rc.diffs = append(rc.diffs, diff)
 	}
@@ -307,7 +314,6 @@ func (rc *ResultComparator) Record(r ReplayResult) {
 		)
 		rc.outputFile.WriteString(line)
 	}
-	rc.mu.Unlock()
 }
 
 func (rc *ResultComparator) analyze(r ReplayResult) Diff {
@@ -348,10 +354,15 @@ func (rc *ResultComparator) Summary() map[DiffType]int {
 	return counts
 }
 
-// Close flushes and closes the output file.
+// Close flushes and closes the output file. Safe for concurrent use with Record.
 func (rc *ResultComparator) Close() error {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.closed = true
 	if rc.outputFile != nil {
-		return rc.outputFile.Close()
+		err := rc.outputFile.Close()
+		rc.outputFile = nil
+		return err
 	}
 	return nil
 }
@@ -377,3 +388,4 @@ func truncate(s string, maxLen int) string {
 	}
 	return s[:maxLen] + "..."
 }
+

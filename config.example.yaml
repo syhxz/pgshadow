@@ -40,6 +40,20 @@ metrics:
   enabled: true
   port: 9090                 # Prometheus metrics HTTP port
 
+# Optional: external signal-driven control plane.
+# When enabled, pgshadow exposes HTTP endpoints for external orchestration
+# (Patroni callbacks, CNPG hooks, K8s lifecycle hooks, scripts) to
+# activate/pause capture without pgshadow needing to detect PG role changes.
+#
+# Endpoints:
+#   POST /control/activate  — start/resume capture
+#   POST /control/pause     — stop/pause capture
+#   GET  /control/status    — return current state (JSON)
+#
+# control:
+#   enabled: true
+#   port: 9091               # control plane HTTP port (default 9091)
+
 # Optional: logging configuration (defaults to info level, text format)
 # Log level: debug, info, warn, error, fatal
 # Log format: text, json
