@@ -43,6 +43,13 @@ const typedHeaderLen = 5
 // startupHeaderLen is the size of a startup-phase header: 4 length bytes only.
 const startupHeaderLen = 4
 
+// maxStalledBuffer is the maximum number of bytes retained without yielding a
+// valid message before the parser considers the stream non-PG (e.g. WAL
+// replication) and enters stalled mode, discarding further input (Issue #7).
+// Set to 1 MiB — well above any legitimate partial PG message but prevents
+// unbounded growth from replication traffic.
+const maxStalledBuffer = 1 << 20
+
 // startupMsgType is the synthetic PGMessage.Type used to represent an untyped
 // startup-phase message (which has no type byte on the wire). Real typed
 // messages always carry a non-zero ASCII type byte, so 0 is unambiguous.
@@ -57,6 +64,7 @@ type streamParser struct {
 	fromClient bool   // frontend direction: the first message is the untyped startup message
 	inStartup  bool   // true while still expecting untyped startup-phase message(s)
 	buf        []byte // retained bytes that did not yet form a complete message
+	stalled    bool   // true when buffer exceeded maxStalledBuffer; discard further input
 }
 
 // NewParser creates a stateful framing parser for one direction of one
@@ -75,7 +83,17 @@ func NewParser(cfg Config, fromClient bool) Parser {
 // Feed appends data to the parser's internal buffer and emits every complete
 // message that can now be framed, in order. Bytes that form only a partial
 // message are retained for the next Feed call (R3.1).
+//
+// Issue #7: If the buffer grows beyond maxStalledBuffer without yielding a valid
+// message (indicating a non-PG stream such as WAL replication), the parser
+// enters stalled mode and discards all further input to prevent unbounded memory
+// growth.
 func (p *streamParser) Feed(data []byte) ([]core.PGMessage, error) {
+	// Once stalled, discard all further input — this stream is not parseable PG.
+	if p.stalled {
+		return nil, nil
+	}
+
 	if len(data) > 0 {
 		p.buf = append(p.buf, data...)
 	}
@@ -109,8 +127,40 @@ func (p *streamParser) Feed(data []byte) ([]core.PGMessage, error) {
 		}
 	}
 
+	// Issue #7: If buffer has grown very large without yielding any messages in
+	// this Feed call AND no messages were produced, the stream is likely WAL
+	// replication or some other non-PG protocol. Enter stalled mode to prevent
+	// memory exhaustion.
+	//
+	// Guard: do NOT stall if the buffer's leading message declares a valid
+	// length that we're simply waiting on more bytes for. A legitimate large
+	// message (e.g. 2MB SQL or COPY chunk) must not be mistaken for WAL data.
+	if len(msgs) == 0 && len(p.buf) > maxStalledBuffer && !p.hasValidPendingFrame() {
+		p.buf = nil
+		p.stalled = true
+		return nil, nil
+	}
+
 	p.compact()
 	return msgs, nil
+}
+
+// hasValidPendingFrame checks if the current buffer starts with a message header
+// whose declared length is within the acceptable maximum (256MB). If so, the
+// large buffer is just an in-progress legitimate message, not garbage data.
+func (p *streamParser) hasValidPendingFrame() bool {
+	if p.inStartup {
+		if len(p.buf) >= startupHeaderLen {
+			length := binary.BigEndian.Uint32(p.buf[0:4])
+			return length >= 4 && length <= 256*1024*1024
+		}
+		return false
+	}
+	if len(p.buf) >= typedHeaderLen {
+		length := binary.BigEndian.Uint32(p.buf[1:5])
+		return length >= 4 && length <= 256*1024*1024
+	}
+	return false
 }
 
 // compact drops the consumed prefix's backing array so a fully drained stream

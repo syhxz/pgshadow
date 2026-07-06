@@ -40,6 +40,12 @@ import (
 // event cannot wedge a lane forever (R7.6).
 const defaultRetryAttempts = 3
 
+// maxPacingDelay caps the maximum pacing delay to prevent replay stalls caused
+// by system clock jumps (Issue #19). If NTP corrects the clock backward by e.g.
+// 1 hour, the computed inter-arrival gap would be 1 hour, stalling replay.
+// Capping at 30 seconds bounds the impact of clock discontinuities.
+const maxPacingDelay = 30 * time.Second
+
 // sleeper delays for d or returns early if ctx is cancelled. It is injected so
 // pacing is deterministic and non-blocking in tests (R7.4).
 type sleeper func(ctx context.Context, d time.Duration)
@@ -96,6 +102,11 @@ func (p *pacingExecutor) Exec(ctx context.Context, conn core.ConnID, ev *core.SQ
 	p.havePrev = true
 	p.prev = ev.Timestamp
 	p.mu.Unlock()
+
+	// Issue #19: Cap the delay to prevent NTP clock jumps from stalling replay.
+	if delay > maxPacingDelay {
+		delay = maxPacingDelay
+	}
 
 	if delay > 0 {
 		p.sleep(ctx, delay)

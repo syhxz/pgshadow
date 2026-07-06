@@ -31,6 +31,11 @@ import (
 // liveness so that dead connections are proactively replaced (R9.5).
 const defaultHealthCheckPeriod = 30 * time.Second
 
+// defaultAcquireTimeout is the maximum time to wait for a connection from the
+// pool before returning an error (Issue #15). This prevents all lane workers
+// from blocking indefinitely when the target DB is at max_connections.
+const defaultAcquireTimeout = 30 * time.Second
+
 // connHandle abstracts a single leased connection. It is satisfied by the
 // production pgx lease (pgxLease) and by test fakes, so the affinity logic can
 // be exercised without a live database.
@@ -226,8 +231,9 @@ func (s *pgxConnSource) Close() { s.pool.Close() }
 // ConnPool is the production affinity-aware connection pool. It implements the
 // Pool interface from replayer.go.
 type ConnPool struct {
-	core *affinityPool
-	src  *pgxConnSource
+	core           *affinityPool
+	src            *pgxConnSource
+	acquireTimeout time.Duration
 }
 
 // compile-time assertion that ConnPool satisfies the Pool interface.
@@ -270,19 +276,42 @@ func NewPool(ctx context.Context, cfg Config) (*ConnPool, error) {
 		return nil, fmt.Errorf("connect target pool: %w", err)
 	}
 
+	// Issue #16: Log the target database version at startup so operators can
+	// verify compatibility with the source. A version mismatch (e.g. source
+	// PG16 using MERGE syntax, target PG14) will cause replay errors that are
+	// visible in metrics, but early detection via log is valuable.
+	if conn, err := pool.Acquire(ctx); err == nil {
+		var version string
+		if err := conn.QueryRow(ctx, "SHOW server_version").Scan(&version); err == nil {
+			fmt.Fprintf(os.Stderr, "pgshadow: INFO target database version: %s\n", version)
+		}
+		conn.Release()
+	}
+
 	src := &pgxConnSource{pool: pool}
+	acquireTimeout := defaultAcquireTimeout
+	if cfg.AcquireTimeout > 0 {
+		acquireTimeout = time.Duration(cfg.AcquireTimeout) * time.Second
+	}
 	return &ConnPool{
-		core: newAffinityPool(src, cfg.SessionAffinity),
-		src:  src,
+		core:           newAffinityPool(src, cfg.SessionAffinity),
+		src:            src,
+		acquireTimeout: acquireTimeout,
 	}, nil
 }
 
 // AcquireFor leases a target connection for the given source ConnID. Under
 // session affinity the same ConnID always maps to the same connection until it
 // is released (R7.5, R7.10). When the pool is exhausted at MaxConns the call
-// blocks until a connection frees or ctx is done (R9.6).
+// blocks until a connection frees, the acquire timeout expires, or ctx is done
+// (R9.6, Issue #15).
 func (p *ConnPool) AcquireFor(ctx context.Context, conn core.ConnID) (*pgxpool.Conn, error) {
-	h, err := p.core.acquireFor(ctx, conn)
+	// Issue #15: Apply acquire timeout to prevent indefinite blocking when the
+	// target DB is at max_connections.
+	acquireCtx, cancel := context.WithTimeout(ctx, p.acquireTimeout)
+	defer cancel()
+
+	h, err := p.core.acquireFor(acquireCtx, conn)
 	if err != nil {
 		return nil, err
 	}

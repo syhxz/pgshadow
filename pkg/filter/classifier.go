@@ -88,7 +88,57 @@ func NewClassifier(extraBuiltins []string) Classifier {
 // Classify performs case-insensitive leading-keyword classification (R5.1),
 // splitting SELECT into ClassPlainSelect vs ClassProcSelect via the heuristic
 // (R5.3). Unrecognized or empty input yields ClassUnknown.
+//
+// Multi-statement Simple Query (Issue #6): when sql contains multiple
+// semicolon-separated statements, the classification is the "most permissive"
+// (most side-effecting) class among all sub-statements, so that a batch
+// containing any DML/DDL is never incorrectly dropped as a plain SELECT.
 func (c *classifier) Classify(sql string) StmtClass {
+	// Fast path: check for multi-statement (semicolon followed by non-whitespace).
+	if idx := indexDepthZeroSemicolon(sql); idx >= 0 {
+		return c.classifyMultiStatement(sql)
+	}
+	return c.classifySingle(sql)
+}
+
+// stmtClassPriority defines the "keep priority" of each class for multi-statement
+// classification. Higher priority classes win when multiple statements are present.
+var stmtClassPriority = map[StmtClass]int{
+	ClassUnknown:        0,
+	ClassPlainSelect:    1,
+	ClassUtility:        2,
+	ClassProcSelect:     3,
+	ClassCopyFrom:       4,
+	ClassDML:            5,
+	ClassDDL:            6,
+	ClassBegin:          7,
+	ClassCommitRollback: 8,
+	ClassCall:           5,
+}
+
+// classifyMultiStatement splits sql on depth-zero semicolons and returns the
+// highest-priority class among all sub-statements.
+func (c *classifier) classifyMultiStatement(sql string) StmtClass {
+	best := ClassUnknown
+	bestPri := 0
+
+	stmts := splitOnDepthZeroSemicolons(sql)
+	for _, stmt := range stmts {
+		trimmed := strings.TrimSpace(stmt)
+		if trimmed == "" {
+			continue
+		}
+		cls := c.classifySingle(trimmed)
+		if pri := stmtClassPriority[cls]; pri > bestPri {
+			bestPri = pri
+			best = cls
+		}
+	}
+	return best
+}
+
+// classifySingle classifies a single SQL statement (no embedded semicolons).
+func (c *classifier) classifySingle(sql string) StmtClass {
 	toks := lex(sql)
 	defer tokPool.Put(toks[:0])
 	leading := firstWord(toks)
@@ -104,8 +154,22 @@ func (c *classifier) Classify(sql string) StmtClass {
 		return ClassDDL
 	case "begin", "start":
 		return ClassBegin
-	case "commit", "rollback", "end":
+	case "commit", "end":
 		return ClassCommitRollback
+	case "rollback":
+		// Issue #11: ROLLBACK TO SAVEPOINT does NOT end the transaction — it
+		// only reverts to the savepoint. Only a bare ROLLBACK (or ROLLBACK
+		// WORK/TRANSACTION) ends the transaction and should reset TxID.
+		if hasSecondWord(toks, "to") {
+			// ROLLBACK TO [SAVEPOINT] name — this is a utility/savepoint operation,
+			// NOT a transaction-ending statement. Classify as Utility so the
+			// state machine does not reset the transaction.
+			return ClassUtility
+		}
+		return ClassCommitRollback
+	case "savepoint", "release":
+		// SAVEPOINT name / RELEASE SAVEPOINT name — utility, not tx boundary.
+		return ClassUtility
 	case "set", "reset", "discard":
 		return ClassUtility
 	case "copy":
@@ -197,6 +261,21 @@ func firstWord(toks []token) string {
 	return ""
 }
 
+// hasSecondWord returns true if the second word token (case-insensitive) matches
+// the given word. Used to distinguish "ROLLBACK" from "ROLLBACK TO ..." (Issue #11).
+func hasSecondWord(toks []token, word string) bool {
+	found := 0
+	for _, t := range toks {
+		if t.kind == tokWord {
+			found++
+			if found == 2 {
+				return strings.ToLower(t.text) == word
+			}
+		}
+	}
+	return false
+}
+
 // depthZeroHasWord reports whether the given lowercased word appears as a word
 // token at parenthesis depth zero.
 func depthZeroHasWord(toks []token, word string) bool {
@@ -241,6 +320,158 @@ func primaryCommandAfterWith(toks []token) string {
 		}
 	}
 	return ""
+}
+
+// indexDepthZeroSemicolon returns the byte index of the first semicolon in sql
+// that is at parenthesis depth zero and outside any string literal, comment, or
+// dollar-quoted block. It returns -1 if no such semicolon exists. This is used
+// as a fast check for multi-statement Simple Query (Issue #6).
+func indexDepthZeroSemicolon(sql string) int {
+	depth := 0
+	n := len(sql)
+	for i := 0; i < n; i++ {
+		c := sql[i]
+		switch {
+		case c == '-' && i+1 < n && sql[i+1] == '-':
+			// Line comment — skip to end of line
+			i += 2
+			for i < n && sql[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && sql[i+1] == '*':
+			// Block comment (nestable)
+			i += 2
+			d := 1
+			for i < n && d > 0 {
+				if i+1 < n && sql[i] == '/' && sql[i+1] == '*' {
+					d++
+					i += 2
+					continue
+				}
+				if i+1 < n && sql[i] == '*' && sql[i+1] == '/' {
+					d--
+					i += 2
+					continue
+				}
+				i++
+			}
+			i-- // outer loop will i++
+		case c == '\'':
+			// String literal — skip to closing quote
+			i++
+			for i < n {
+				if sql[i] == '\'' {
+					if i+1 < n && sql[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					break
+				}
+				i++
+			}
+		case c == '$':
+			// Dollar-quoted string
+			if tag, adv, ok := dollarTag(sql, i); ok {
+				closeTag := "$" + tag + "$"
+				i += adv
+				if idx := strings.Index(sql[i:], closeTag); idx >= 0 {
+					i += idx + len(closeTag) - 1
+				} else {
+					i = n - 1
+				}
+			}
+		case c == '(':
+			depth++
+		case c == ')':
+			if depth > 0 {
+				depth--
+			}
+		case c == ';' && depth == 0:
+			// Check if there's any non-whitespace after the semicolon
+			for j := i + 1; j < n; j++ {
+				ch := sql[j]
+				if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+					return i
+				}
+			}
+			// Only trailing whitespace after semicolon — single statement
+			return -1
+		}
+	}
+	return -1
+}
+
+// splitOnDepthZeroSemicolons splits sql into individual statements at
+// semicolons that occur at parenthesis depth zero and outside string literals.
+func splitOnDepthZeroSemicolons(sql string) []string {
+	var stmts []string
+	depth := 0
+	n := len(sql)
+	start := 0
+
+	for i := 0; i < n; i++ {
+		c := sql[i]
+		switch {
+		case c == '-' && i+1 < n && sql[i+1] == '-':
+			i += 2
+			for i < n && sql[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && sql[i+1] == '*':
+			i += 2
+			d := 1
+			for i < n && d > 0 {
+				if i+1 < n && sql[i] == '/' && sql[i+1] == '*' {
+					d++
+					i += 2
+					continue
+				}
+				if i+1 < n && sql[i] == '*' && sql[i+1] == '/' {
+					d--
+					i += 2
+					continue
+				}
+				i++
+			}
+			i--
+		case c == '\'':
+			i++
+			for i < n {
+				if sql[i] == '\'' {
+					if i+1 < n && sql[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					break
+				}
+				i++
+			}
+		case c == '$':
+			if tag, adv, ok := dollarTag(sql, i); ok {
+				closeTag := "$" + tag + "$"
+				i += adv
+				if idx := strings.Index(sql[i:], closeTag); idx >= 0 {
+					i += idx + len(closeTag) - 1
+				} else {
+					i = n - 1
+				}
+			}
+		case c == '(':
+			depth++
+		case c == ')':
+			if depth > 0 {
+				depth--
+			}
+		case c == ';' && depth == 0:
+			stmts = append(stmts, sql[start:i])
+			start = i + 1
+		}
+	}
+	// Remaining text after last semicolon (or the whole string if no semicolons)
+	if start < n {
+		stmts = append(stmts, sql[start:])
+	}
+	return stmts
 }
 
 // --- lightweight SQL lexer ---------------------------------------------------

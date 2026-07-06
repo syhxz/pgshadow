@@ -204,6 +204,11 @@ func (q *fileQueue) Enqueue(ev *core.SQLEvent) (dropped bool) {
 	if q.count < q.capacity {
 		if err := q.writeRecord(payload); err != nil {
 			q.mu.Unlock()
+			// Issue #17: Log the write error and record as overflow so metrics
+			// alert operators to silent event loss (e.g. disk full).
+			fmt.Fprintf(os.Stderr, "pgshadow: ERROR filequeue: write failed (conn=%v seq=%d): %v (event dropped)\n",
+				ev.Conn, ev.Seq, err)
+			q.recordOverflow()
 			return true
 		}
 		q.count++
@@ -232,6 +237,10 @@ func (q *fileQueue) Enqueue(ev *core.SQLEvent) (dropped bool) {
 		}
 		if err := q.writeRecord(payload); err != nil {
 			q.mu.Unlock()
+			// Issue #17: write failure after unblocking — log and alert.
+			fmt.Fprintf(os.Stderr, "pgshadow: ERROR filequeue: write failed after unblock (conn=%v seq=%d): %v (event dropped)\n",
+				ev.Conn, ev.Seq, err)
+			q.recordOverflow()
 			return true
 		}
 		q.count++
@@ -247,6 +256,10 @@ func (q *fileQueue) Enqueue(ev *core.SQLEvent) (dropped bool) {
 		}
 		if err := q.writeRecord(payload); err != nil {
 			q.mu.Unlock()
+			// Issue #17: write failure after eviction — log and alert.
+			fmt.Fprintf(os.Stderr, "pgshadow: ERROR filequeue: write failed after eviction (conn=%v seq=%d): %v (event dropped)\n",
+				ev.Conn, ev.Seq, err)
+			q.recordOverflow()
 			return true
 		}
 		q.count++
