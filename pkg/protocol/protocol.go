@@ -23,9 +23,10 @@ type Parser interface {
 
 // Config configures the protocol parser.
 type Config struct {
-	MaxSQLLength  int  `yaml:"max_sql_length"`    // bytes; default 1<<20 R3.5
-	TimeoutIdle   int  `yaml:"timeout_idle_conn"` // seconds; default 300 R2.4
-	ExtendedQuery bool `yaml:"extended_query"`    // default true R3.4
+	MaxSQLLength     int  `yaml:"max_sql_length"`      // bytes; default 1<<20 R3.5
+	TimeoutIdle      int  `yaml:"timeout_idle_conn"`   // seconds; default 300 R2.4
+	ExtendedQuery    bool `yaml:"extended_query"`      // default true R3.4
+	ConnectionPooler bool `yaml:"connection_pooler"`   // true when a pooler (PgBouncer/Odyssey) sits between capture and PG
 }
 
 // TxIDGenerator (R3.8) is defined in txid.go; it allocates monotonic TxIDs per

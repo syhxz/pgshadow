@@ -123,6 +123,7 @@ type Config struct {
 	PoolMaxConns    int             `yaml:"pool_max_conns"`          // default 100 R9.2
 	PoolMinConns    int             `yaml:"pool_min_conns"`          // default 20 R9.3
 	MaxLaneDepth    int             `yaml:"max_lane_depth"`          // max total events buffered in lanes; 0 = default (100000)
+	AcquireTimeout  int             `yaml:"acquire_timeout"`         // seconds to wait for a pool connection; 0 = default (30s). Issue #15.
 }
 
 // PoolStats reports connection pool usage.

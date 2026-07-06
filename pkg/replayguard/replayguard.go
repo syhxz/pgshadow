@@ -114,6 +114,13 @@ func New(cfg Config) *Guard {
 		regexp.MustCompile(`(?i)\bfrom\s+\w+\.\w+\.\w+`), // FDW three-part names
 		regexp.MustCompile(`(?i)\blo_import\s*\(`),
 		regexp.MustCompile(`(?i)\blo_export\s*\(`),
+		// Issue #13: Advisory locks can cause deadlocks on the target DB when
+		// replayed, since the lock semantics depend on the original application's
+		// coordination which is not present during replay.
+		regexp.MustCompile(`(?i)\bpg_advisory_lock\s*\(`),
+		regexp.MustCompile(`(?i)\bpg_advisory_xact_lock\s*\(`),
+		regexp.MustCompile(`(?i)\bpg_try_advisory_lock\s*\(`),
+		regexp.MustCompile(`(?i)\bpg_try_advisory_xact_lock\s*\(`),
 	}
 
 	// Table include patterns (#18)

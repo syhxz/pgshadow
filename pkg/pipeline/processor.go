@@ -13,8 +13,10 @@
 package pipeline
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"pgshadow/pkg/core"
@@ -35,6 +37,15 @@ const (
 	MsgCopyDone byte = 'c' // CopyDone: COPY FROM finished (R3.10)
 	MsgCopyFail byte = 'f' // CopyFail: COPY FROM aborted (R3.10)
 )
+
+// msgStartup is the synthetic type byte used for untyped startup-phase messages
+// (StartupMessage, SSLRequest, CancelRequest). See protocol.startupMsgType.
+const msgStartup byte = 0
+
+// cancelRequestCode identifies a CancelRequest message (Issue #5). The first 4
+// bytes of the startup payload carry this code. CancelRequest connections are
+// ephemeral (no SQL follows) and should not accumulate protocol state.
+const cancelRequestCode uint32 = 80877102
 
 // Server→client message type bytes that bound a backend command. ReadyForQuery
 // drives the transaction state machine (R12.1/R4.1); both close a statement for
@@ -198,6 +209,34 @@ func (sp *StreamProcessor) parsersFor(conn core.ConnID) *ConnParsers {
 	return cp
 }
 
+// resetPoolerSession clears per-connection protocol state when a connection
+// pooler (PgBouncer/Odyssey) reassigns the server connection to a different
+// client session. The signal is a DISCARD ALL, RESET ALL, or DEALLOCATE ALL
+// statement which poolers send as server_reset_query between sessions. This
+// prevents prepared statement cross-contamination across logical sessions that
+// share the same TCP four-tuple (Issue #1).
+func (sp *StreamProcessor) resetPoolerSession(conn core.ConnID) {
+	sp.binder.Forget(conn)
+	sp.copies.Discard(conn)
+	sp.txGen.Reset(conn)
+	sp.timer.Forget(conn)
+}
+
+// isPoolerResetQuery returns true if sql is a session-reset command typically
+// issued by a connection pooler between client sessions.
+func isPoolerResetQuery(sql string) bool {
+	if len(sql) < 9 { // shortest match: "RESET ALL" = 9 chars
+		return false
+	}
+	upper := strings.ToUpper(strings.TrimSpace(sql))
+	return upper == "DISCARD ALL" ||
+		upper == "RESET ALL" ||
+		upper == "DEALLOCATE ALL" ||
+		strings.HasPrefix(upper, "DISCARD ALL;") ||
+		strings.HasPrefix(upper, "RESET ALL;") ||
+		strings.HasPrefix(upper, "DEALLOCATE ALL;")
+}
+
 // handleClient routes one client→server message. Simple_Query is extracted by
 // the EventBuilder and dispatched immediately. Parse defines a prepared
 // statement (registered for later Bind correlation) but does not itself emit a
@@ -205,6 +244,16 @@ func (sp *StreamProcessor) parsersFor(conn core.ConnID) *ConnParsers {
 // values (R3.9). COPY FROM buffers its data stream and emits a single event,
 // with the payload attached, on CopyDone (R3.10).
 func (sp *StreamProcessor) handleClient(conn core.ConnID, msg core.PGMessage, ts time.Time) {
+	// Issue #5: CancelRequest is a startup-phase message (type=0) on an ephemeral
+	// TCP connection. It carries no SQL and the connection closes immediately after.
+	// Skip it to avoid creating orphan ConnID state with no useful content.
+	if msg.Type == msgStartup && len(msg.Payload) >= 4 {
+		code := binary.BigEndian.Uint32(msg.Payload[0:4])
+		if code == cancelRequestCode {
+			return
+		}
+	}
+
 	switch msg.Type {
 	case MsgParse:
 		// Parse carries SQL + declared parameter OIDs. Record it so a later
@@ -232,6 +281,15 @@ func (sp *StreamProcessor) handleClient(conn core.ConnID, msg core.PGMessage, ts
 			// Parse; orphan Binds do not produce events and must not pollute
 			// the SourceExecTime metric with unrelated timings.
 			sp.timer.OnClientQuery(conn, ts)
+		} else {
+			// Issue #20: Orphaned Bind — no matching Parse on this connection.
+			// This typically happens after pgshadow restart when existing
+			// connections had Parsed statements before capture began. Record as
+			// a parse error so it's visible in metrics and operators know
+			// Extended Query events are being lost until clients re-Parse.
+			if sp.collector != nil {
+				sp.collector.ParseError()
+			}
 		}
 
 	case MsgCopyData:
@@ -306,6 +364,15 @@ func (sp *StreamProcessor) dispatch(conn core.ConnID, ev *core.SQLEvent, ts time
 	sp.sm.OnStatement(conn, class)
 	if class == filter.ClassCommitRollback {
 		sp.txGen.Reset(conn)
+	}
+
+	// Connection pooler session boundary detection (Issue #1): when a pooler
+	// (PgBouncer/Odyssey) reuses a server connection for a different client,
+	// it sends DISCARD ALL / RESET ALL / DEALLOCATE ALL as its
+	// server_reset_query. Clear per-connection protocol state so that prepared
+	// statements from the previous logical session don't contaminate the next.
+	if sp.cfg.ConnectionPooler && class == filter.ClassUtility && isPoolerResetQuery(ev.SQL) {
+		sp.resetPoolerSession(conn)
 	}
 }
 
