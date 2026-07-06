@@ -278,6 +278,11 @@ func (r *replayer) Run(ctx context.Context) error {
 	var laneWG sync.WaitGroup
 	lanes := make(map[string]*unboundedLane)
 
+	// replayLagSec tracks how far behind real-time the replay is, computed from
+	// the most recently dequeued event's capture timestamp. Used to drive the
+	// max_replay_lag_seconds backpressure threshold in the replayguard.
+	var replayLagSec float64
+
 dispatch:
 	for {
 		// Backpressure check: pause dequeue when total lane buffer depth exceeds
@@ -293,7 +298,7 @@ dispatch:
 			laneDepth += l.Len()
 		}
 
-		for laneDepth >= r.maxLaneDepth || (r.guard != nil && r.guard.CheckBackpressure(r.q.Depth()+laneDepth, 0)) {
+		for laneDepth >= r.maxLaneDepth || (r.guard != nil && r.guard.CheckBackpressure(r.q.Depth()+laneDepth, replayLagSec)) {
 			select {
 			case <-ctx.Done():
 				break dispatch
@@ -309,6 +314,14 @@ dispatch:
 		if !ok {
 			// Queue closed and drained, or ctx done.
 			break
+		}
+
+		// Update replay lag: the difference between wall-clock time and the
+		// event's capture timestamp tells us how far behind real-time the
+		// replay is. This drives the max_replay_lag_seconds backpressure
+		// threshold in the replayguard.
+		if !ev.Timestamp.IsZero() {
+			replayLagSec = time.Since(ev.Timestamp).Seconds()
 		}
 
 		key := r.laneKey(ev)

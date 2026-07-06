@@ -294,6 +294,7 @@ func (p *pipelineState) drain(stderr io.Writer) {
 // exits promptly. The resources closed here are nil'd out of components so the
 // deferred components.Close in run does not double-close them.
 func (p *pipelineState) drainWithin(timeout time.Duration, stderr io.Writer) {
+	drainStart := time.Now()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	timedOut := false
@@ -332,9 +333,19 @@ func (p *pipelineState) drainWithin(timeout time.Duration, stderr io.Writer) {
 	// the producer timed out, the queue is already closed (step 3) and the
 	// consumer may be mid-drain, so we always give it the remaining deadline
 	// rather than force-cancelling immediately (R12.5 step 4).
+	//
+	// We use a fresh timer here because the original deadline timer may have
+	// already fired (its channel delivers at most once). Computing the remaining
+	// time from the drain start ensures step 4 always has a functioning timeout.
+	remaining := timeout - time.Since(drainStart)
+	if remaining <= 0 {
+		remaining = 1 * time.Millisecond
+	}
+	consumerDeadline := time.NewTimer(remaining)
+	defer consumerDeadline.Stop()
 	select {
 	case <-p.consumerDone:
-	case <-deadline.C:
+	case <-consumerDeadline.C:
 		timedOut = true
 		fmt.Fprintln(stderr, "pgshadow: shutdown: replay drain timed out; forcing stop")
 	}

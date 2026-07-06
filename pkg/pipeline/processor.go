@@ -227,9 +227,12 @@ func (sp *StreamProcessor) handleClient(conn core.ConnID, msg core.PGMessage, ts
 				Timestamp: ts,
 			}
 			sp.dispatch(conn, ev, ts)
+			// Bind begins an execution that the backend will run (R10.7).
+			// Only start the timer when the Bind successfully correlated to a
+			// Parse; orphan Binds do not produce events and must not pollute
+			// the SourceExecTime metric with unrelated timings.
+			sp.timer.OnClientQuery(conn, ts)
 		}
-		// Bind begins an execution that the backend will run (R10.7).
-		sp.timer.OnClientQuery(conn, ts)
 
 	case MsgCopyData:
 		sp.copies.Data(conn, msg.Payload)
