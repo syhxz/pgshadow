@@ -717,9 +717,148 @@ if ev.Extended && len(ev.Params) > 0 {
 
 ---
 
+## Production Deployment
+
+### systemd Service
+
+A production-ready systemd unit and deployment script are provided in `deploy/`:
+
+```bash
+# Build + install + configure systemd (requires root)
+sudo bash deploy/deploy.sh
+
+# Or skip build if binary is already compiled
+sudo bash deploy/deploy.sh --skip-build
+```
+
+This installs:
+- Binary to `/opt/pgshadow/pgshadow`
+- Config to `/opt/pgshadow/config.yaml`
+- Secrets to `/opt/pgshadow/env` (chmod 600)
+- systemd unit to `/etc/systemd/system/pgshadow.service`
+- logrotate config to `/etc/logrotate.d/pgshadow`
+
+Service management:
+```bash
+sudo systemctl start pgshadow     # Start
+sudo systemctl enable pgshadow    # Enable on boot
+sudo systemctl status pgshadow    # Check status
+sudo journalctl -u pgshadow -f    # Tail logs
+sudo systemctl restart pgshadow   # Restart (graceful)
+```
+
+systemd features:
+- **OOM protection**: `OOMScoreAdjust=-500` (kernel kills other processes first)
+- **Auto-restart**: restarts on failure after 5s delay
+- **Graceful shutdown**: SIGTERM with 30s drain timeout
+- **Security**: `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`
+- **Logging**: stdout/stderr → journald (automatic rotation)
+
+### TLS to Target Database
+
+Connections to the target database use TLS by default (`sslmode=require`). Configure in config.yaml:
+
+```yaml
+replayer:
+  sslmode: "require"          # require | verify-ca | verify-full | disable
+  ssl_root_cert: ""           # path to CA cert (for verify-ca / verify-full)
+```
+
+For AWS RDS/Aurora, `require` is sufficient (AWS manages certificates internally). For on-premise deployments, use `verify-full` with the server's CA certificate.
+
+---
+
+## Safeguard (Production Safety)
+
+The `safeguard` section in config.yaml provides production safety controls that filter/rewrite SQL before replay:
+
+```yaml
+safeguard:
+  # DDL protection: block CREATE/ALTER/DROP/TRUNCATE
+  exclude_ddl: true
+
+  # Time function rewriting: replace now()/current_timestamp with captured time
+  rewrite_time_functions: false   # ~5万 QPS when enabled (regex overhead)
+
+  # External dependencies: skip dblink/FDW/pg_notify/advisory locks
+  skip_external_deps: true
+
+  # Backpressure: pause when replay falls behind
+  max_replay_lag_seconds: 60
+  max_queue_depth: 500000
+
+  # Large transaction protection
+  max_transaction_duration: "120s"
+  max_statements_per_tx: 10000
+
+  # Selective replay
+  replay_percentage: 100          # 0-100
+  include_tables: []
+  exclude_tables: ["audit_log"]
+  read_only: false                # true = SELECT only (query plan validation)
+
+  # Data masking
+  mask_patterns:
+    - pattern: "'[0-9]{13,19}'"
+      replacement: "'****MASKED****'"
+```
+
+Key safeguards:
+| Feature | What it does | Performance impact |
+|---------|-------------|-------------------|
+| `exclude_ddl` | Block DDL to protect target schema | Negligible |
+| `skip_external_deps` | Skip dblink, FDW, pg_notify, advisory locks | Negligible |
+| `rewrite_time_functions` | Replace `now()` with captured timestamp | ~24μs/event |
+| `mask_patterns` | Regex-based data masking | ~24μs/event per pattern |
+| Backpressure | Pause capture when replay lags | Zero (check only) |
+
+---
+
+## Connection Pooler (PgBouncer / Odyssey)
+
+When capturing traffic between a connection pooler and PostgreSQL, enable `connection_pooler` mode:
+
+```yaml
+parser:
+  connection_pooler: true
+```
+
+This solves the problem of TCP four-tuple reuse: PgBouncer multiplexes different client sessions over the same server connection. Without this flag, prepared statements from one session could contaminate the next.
+
+When enabled, pgshadow detects session-reset commands (`DISCARD ALL`, `RESET ALL`, `DEALLOCATE ALL`) — which poolers send as `server_reset_query` between sessions — and clears per-connection protocol state (prepared statements, transaction ID, COPY buffers).
+
+---
+
+## Performance
+
+Benchmarked on ARM64 (2 cores), single-core throughput:
+
+| Component | Ops/sec | Latency | Allocations |
+|-----------|---------|---------|-------------|
+| RingBuffer enqueue | 52M | 23ns | 0 |
+| EventBuilder (SQL extraction) | 6.2M | 188ns | 2 |
+| Protocol framing (10 msgs/chunk) | 1.3M | 950ns | 19 |
+| Classifier (SQL classification) | 3.8M | 313ns | 2 |
+| Filter decision | 2.9M | 412ns | 2 |
+| Multi-statement classification | 1.2M | 974ns | 10 |
+| Replayguard (all safeguards off) | 6M+ | ~195ns | 0 |
+| Replayguard (time rewrite on) | 49K | 24μs | 11 |
+
+**Throughput budget** (single-core, end-to-end local path):
+
+- With safeguards off: **>1M events/sec** — limited by protocol framing
+- With time rewriting: **~49K events/sec** — limited by regex
+- Real-world bottleneck: **target DB execution speed** (typically 5K–30K QPS)
+
+Memory: hot path allocates 0–2 objects per event; GC pressure is minimal even at high throughput.
+
+---
+
 ## Limitations
 
 - COPY FROM STDIN: single COPY operation capped at 256 MiB in-memory buffering; larger bulk loads are skipped
 - Single-goroutine TCP reassembly: may hit single-core bottleneck above 10 Gbps
 - Greenplum: replays to Master only, no segment fan-out
 - eBPF mode: requires Linux kernel ≥ 5.8 with BTF; on loopback interface runs in generic/SKB mode (slightly lower performance than native driver mode on physical NICs)
+- Connection pooler mode: requires the pooler's `server_reset_query` to include `DISCARD ALL` or `RESET ALL` (PgBouncer default)
+- Mid-stream capture: if pgshadow starts while connections are already active, Extended Query events on those connections are lost until clients re-issue Parse
