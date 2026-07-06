@@ -112,6 +112,8 @@ type Config struct {
 	TargetDatabase  string          `yaml:"target_database"`
 	TargetUser      string          `yaml:"target_user"`
 	PasswordEnv     string          `yaml:"password_env"`            // env var name (R11.8)
+	SSLMode         string          `yaml:"sslmode"`                 // disable|require|verify-ca|verify-full; default "require"
+	SSLRootCert     string          `yaml:"ssl_root_cert"`           // path to CA cert for verify-ca/verify-full
 	Workers         int             `yaml:"workers"`                 // default 32 R7.2
 	RateLimitQPS    float64         `yaml:"rate_limit"`              // 0 = unlimited R7.3
 	SpeedFactor     float64         `yaml:"speed_factor"`            // 1.0=original, 0=ASAP R7.4

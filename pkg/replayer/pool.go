@@ -397,6 +397,16 @@ func buildDSN(cfg Config) (string, error) {
 			dsn += " password=" + dsnQuote(pw)
 		}
 	}
+	// TLS: default to "require" for encrypted connections without cert verification.
+	// Use "verify-full" with ssl_root_cert for full server identity validation.
+	sslmode := cfg.SSLMode
+	if sslmode == "" {
+		sslmode = "require"
+	}
+	dsn += " sslmode=" + sslmode
+	if cfg.SSLRootCert != "" {
+		dsn += " sslrootcert=" + dsnQuote(cfg.SSLRootCert)
+	}
 	return dsn, nil
 }
 

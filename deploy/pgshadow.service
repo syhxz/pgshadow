@@ -1,0 +1,52 @@
+[Unit]
+Description=pgshadow - PostgreSQL traffic capture and replay
+Documentation=https://github.com/syhxz/pgshadow
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/pgshadow
+
+# Binary and config
+ExecStart=/opt/pgshadow/pgshadow --config /opt/pgshadow/config.yaml
+
+# Environment: target DB password (or use EnvironmentFile for secrets)
+EnvironmentFile=-/opt/pgshadow/env
+# Example env file content:
+#   PGSHADOW_DB_PASSWORD=your_password_here
+#   KAFKA_PASSWORD=your_kafka_password_here
+
+# Graceful shutdown: send SIGTERM, wait 30s for drain, then SIGKILL
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Auto-restart on failure (not on clean exit)
+Restart=on-failure
+RestartSec=5
+
+# OOM protection: prefer killing other processes over pgshadow
+OOMScoreAdjust=-500
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/pgshadow /tmp /var/log/pgshadow
+PrivateTmp=yes
+
+# Logging: stdout/stderr → journald (structured, rotated automatically)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pgshadow
+
+[Install]
+WantedBy=multi-user.target
